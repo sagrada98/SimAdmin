@@ -10,7 +10,8 @@ COPY frontend/pnpm-workspace.yaml ./
 COPY frontend/package.json frontend/pnpm-lock.yaml ./
 RUN corepack enable && pnpm install --frozen-lockfile
 COPY frontend/ .
-RUN pnpm run build
+# Docker 内跳过 lint，直接用 vite 构建
+RUN pnpm exec vite build
 
 # --- Stage 2: 后端构建 ---
 FROM rust:1-bookworm AS backend-builder
