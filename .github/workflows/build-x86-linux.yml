@@ -25,6 +25,8 @@ jobs:
       - name: Build frontend
         run: |
           cd frontend
+          # pnpm v10+ 需要显式允许 esbuild 原生模块构建
+          jq '.pnpm.onlyBuiltDependencies |= (if . then . + ["esbuild"] | unique else ["esbuild"] end)' package.json > tmp.json && mv tmp.json package.json
           pnpm install --frozen-lockfile
           pnpm run build
 
