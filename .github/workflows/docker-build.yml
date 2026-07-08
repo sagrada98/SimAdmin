@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 env:
-  IMAGE_NAME: sagrada98/simadmin
+  IMAGE_NAME: layui0320/simadmin
 
 jobs:
   build:
