@@ -26,9 +26,6 @@
     "react-router-dom": "^7.9.6",
     "swr": "^2.3.6"
   },
-  "pnpm": {
-    "onlyBuiltDependencies": ["esbuild"]
-  },
   "devDependencies": {
     "@eslint/js": "^9.39.1",
     "@types/node": "^24.10.0",
