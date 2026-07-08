@@ -5,14 +5,14 @@
 
 # --- Stage 1: 前端构建 ---
 FROM node:22-bookworm AS frontend-builder
-WORKDIR /app
-# 先拷依赖清单，利用 Docker 缓存层
-COPY frontend/pnpm-workspace.yaml ./
-COPY frontend/package.json frontend/pnpm-lock.yaml ./
-RUN corepack enable && pnpm install --frozen-lockfile
-# 再拷源码 + VERSION（vite.config.ts 需要读）
+# 重建 repo 目录结构，让相对路径引用正确解析
+WORKDIR /build
 COPY VERSION ./
-COPY frontend/ .
+COPY static/ static/
+COPY frontend/ frontend/
+
+WORKDIR /build/frontend
+RUN corepack enable && pnpm install --frozen-lockfile
 # Docker 内跳过 lint，直接用 vite 构建
 RUN npx vite build --logLevel info
 
@@ -22,7 +22,6 @@ WORKDIR /app
 COPY backend/ .
 RUN cargo build --release && \
     cp target/release/simadmin /app/simadmin && \
-    cp target/release/simadmin /tmp/simadmin.debug && \
     strip /app/simadmin
 
 # --- Stage 3: 运行时 ---
@@ -31,9 +30,8 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
-# 二进制 + 前端静态文件
 COPY --from=backend-builder /app/simadmin /opt/simadmin/simadmin
-COPY --from=frontend-builder /app/dist /opt/simadmin/www
+COPY --from=frontend-builder /build/frontend/dist /opt/simadmin/www
 
 WORKDIR /opt/simadmin
 EXPOSE 3000

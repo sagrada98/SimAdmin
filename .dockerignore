@@ -6,7 +6,6 @@
 **/.gitignore
 **/.gitattributes
 **/docs/
-**/static/
 **/bruno-api/
 **/scripts/
 **/*.md
