@@ -25,8 +25,17 @@ jobs:
       - name: Build frontend
         run: |
           cd frontend
-          # pnpm v10+ 需要显式允许 esbuild 原生模块构建
-          jq '.pnpm.onlyBuiltDependencies |= (if . then . + ["esbuild"] | unique else ["esbuild"] end)' package.json > tmp.json && mv tmp.json package.json
+          # pnpm v10+ 必须显式允许 esbuild 原生模块
+          node -e "
+            const fs = require('fs');
+            const pkg = JSON.parse(fs.readFileSync('package.json'));
+            pkg.pnpm = pkg.pnpm || {};
+            pkg.pnpm.onlyBuiltDependencies = pkg.pnpm.onlyBuiltDependencies || [];
+            if (!pkg.pnpm.onlyBuiltDependencies.includes('esbuild')) {
+              pkg.pnpm.onlyBuiltDependencies.push('esbuild');
+            }
+            fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
+          "
           pnpm install --frozen-lockfile
           pnpm run build
 
