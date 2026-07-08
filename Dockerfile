@@ -6,12 +6,15 @@
 # --- Stage 1: 前端构建 ---
 FROM node:22-bookworm AS frontend-builder
 WORKDIR /app
+# 先拷依赖清单，利用 Docker 缓存层
 COPY frontend/pnpm-workspace.yaml ./
 COPY frontend/package.json frontend/pnpm-lock.yaml ./
 RUN corepack enable && pnpm install --frozen-lockfile
+# 再拷源码 + VERSION（vite.config.ts 需要读）
+COPY VERSION ./
 COPY frontend/ .
 # Docker 内跳过 lint，直接用 vite 构建
-RUN pnpm exec vite build
+RUN npx vite build --logLevel info
 
 # --- Stage 2: 后端构建 ---
 FROM rust:1-bookworm AS backend-builder
