@@ -1,4 +1,4 @@
-name: Build x86_64 Linux
+name: Build Release Binaries
 
 on:
   push:
@@ -6,12 +6,14 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
+  # ============================================
+  # 前端（架构无关，只构建一次）
+  # ============================================
+  frontend:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
 
-      # --- 前端 ---
       - uses: pnpm/action-setup@v4
         with:
           version: 'latest'
@@ -28,24 +30,81 @@ jobs:
           pnpm install --frozen-lockfile
           pnpm run build
 
-      # --- 后端 ---
-      - name: Build backend (x86_64 musl)
-        run: |
-          rustup target add x86_64-unknown-linux-musl
-          sudo apt-get update && sudo apt-get install -y musl-tools
-          cd backend
-          cargo build --release --target x86_64-unknown-linux-musl
-
-      # --- 发布 ---
-      - name: Release (tag push)
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: backend/target/x86_64-unknown-linux-musl/release/simadmin
-
-      - name: Upload artifact (manual run)
-        if: github.event_name == 'workflow_dispatch'
+      - name: Upload frontend dist
         uses: actions/upload-artifact@v4
         with:
-          name: simadmin-x86_64-linux
-          path: backend/target/x86_64-unknown-linux-musl/release/simadmin
+          name: frontend-dist
+          path: frontend/dist/
+
+  # ============================================
+  # 后端（多架构矩阵）
+  # ============================================
+  backend:
+    needs: frontend
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            binary: simadmin-x86_64
+            setup: |
+              sudo apt-get update && sudo apt-get install -y musl-tools
+
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            binary: simadmin-aarch64
+            setup: |
+              sudo apt-get update && sudo apt-get install -y musl-tools
+
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation deps
+        run: ${{ matrix.setup }}
+
+      - name: Download frontend dist
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist/
+
+      - name: Build backend (${{ matrix.target }})
+        run: |
+          cd backend
+          cargo build --release --target ${{ matrix.target }}
+          mkdir -p /tmp/release
+          cp target/${{ matrix.target }}/release/simadmin /tmp/release/${{ matrix.binary }}
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.binary }}
+          path: /tmp/release/${{ matrix.binary }}
+
+  # ============================================
+  # 发布（仅 tag push 时）
+  # ============================================
+  release:
+    needs: backend
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: simadmin-*
+          path: release/
+          merge-multiple: true
+
+      - name: List release assets
+        run: ls -lh release/
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
