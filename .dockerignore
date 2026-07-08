@@ -1,0 +1,12 @@
+**/target/
+**/node_modules/
+**/.git/
+**/README.md
+**/LICENSE
+**/.gitignore
+**/.gitattributes
+**/docs/
+**/static/
+**/bruno-api/
+**/scripts/
+**/*.md
