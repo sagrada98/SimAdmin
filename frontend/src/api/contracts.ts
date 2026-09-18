@@ -38,6 +38,8 @@ export type WorkMode = 'sim' | 'esim'
 export interface WorkModeResponse {
   mode: WorkMode
   worker_running: boolean
+  /** ARMv7 builds hide the eSIM/work-mode module entirely. */
+  esim_supported?: boolean
 }
 
 export interface WorkModeRequest {
@@ -159,8 +161,6 @@ export interface SimInfo {
   puk2_retries?: number
   carrier_config: string
   carrier_config_revision: string
-  sms_used?: number
-  sms_total?: number
 }
 
 export interface UpdateSimCacheRequest {
@@ -578,6 +578,7 @@ export interface ConnectivityCheckResponse {
 export interface WebhookConfig {
   enabled: boolean
   url: string
+  http_method: string
   forward_sms: boolean
   forward_calls: boolean
   forward_ddns: boolean
@@ -644,6 +645,7 @@ export interface PushPlusConfig extends MessageChannelConfig {
 }
 
 export interface WecomAppConfig extends MessageChannelConfig {
+  api_base_url: string
   corp_id: string
   agent_id: string
   secret: string
@@ -681,6 +683,7 @@ export interface FeishuRobotConfig extends MessageChannelConfig {
 }
 
 export interface TelegramConfig extends MessageChannelConfig {
+  api_base_url: string
   bot_token: string
   chat_id: string
   parse_mode: string
@@ -766,6 +769,7 @@ export interface NotificationRule {
   event_codes: string[]
   title_template: string
   template: string
+  custom_body: string
   quiet_hours: QuietHoursSchedule[]
   ddns_failure_threshold: number
   device_status_items: string[]
@@ -892,6 +896,8 @@ export interface OtaMeta {
   frontend_md5: string
   arch: string
   min_version?: string
+  edition?: string
+  wificalling?: boolean
 }
 
 export interface OtaValidation {
@@ -906,6 +912,12 @@ export interface OtaValidation {
 export interface OtaStatusResponse {
   current_version: string
   current_commit: string
+  current_build_time?: string
+  current_binary_md5?: string
+  current_frontend_md5?: string
+  current_arch?: string
+  current_edition?: string
+  installed_meta?: OtaMeta
   pending_update: boolean
   pending_meta?: OtaMeta
 }
@@ -917,6 +929,12 @@ export interface OtaUploadResponse {
 
 export interface OtaOnlinePrepareRequest {
   proxy_prefix?: string
+  asset_name?: string
+}
+
+export interface OtaLatestReleaseRequest {
+  proxy_prefix?: string
+  include_variants?: boolean
 }
 
 export interface OtaReleaseAsset {
@@ -933,6 +951,7 @@ export interface OtaLatestReleaseResponse {
   body?: string
   html_url?: string
   assets?: OtaReleaseAsset[]
+  supports_asset_selection?: boolean
 }
 
 export type DdnsProvider = 'cloudflare' | 'alidns' | 'tencentcloud'
@@ -1067,6 +1086,13 @@ export type AutomationAction =
   | { type: 'restart_baseband'; config: null | Record<string, never> }
   | { type: 'reboot_device'; config: { delay_seconds: number } }
   | {
+      type: 'backup_data'
+      config: {
+        components: BackupComponentKey[]
+        storage: BackupStorageConfig
+      }
+    }
+  | {
       type: 'send_sms'
       config: {
         phone_number: string
@@ -1097,4 +1123,143 @@ export interface AutomationLogEntry {
 export interface AutomationLogsResponse {
   logs: AutomationLogEntry[]
   total: number
+}
+
+export type BackupComponentKey =
+  | 'config'
+  | 'sms'
+  | 'notification_config'
+  | 'notification_logs'
+  | 'notification_queue'
+  | 'automation_config'
+  | 'automation_logs'
+  | 'sim_cache'
+  | 'esim_cache'
+  | 'auth'
+
+export type BackupKind = 'full' | 'slim'
+export type BackupImportMode = 'merge' | 'replace'
+export type BackupScheduleMode = 'manual' | 'fixed' | 'interval'
+export type BackupIntervalUnit = 'mins' | 'hours' | 'days'
+
+export interface BackupComponentOption {
+  key: BackupComponentKey
+  label: string
+  description: string
+  default_selected: boolean
+  sensitive: boolean
+  records?: number | null
+}
+
+export interface BackupOptionsResponse {
+  format_version: number
+  default_components: BackupComponentKey[]
+  components: BackupComponentOption[]
+  local_dir: string
+  pre_restore_dir: string
+}
+
+export interface BackupScheduleConfig {
+  mode: BackupScheduleMode
+  weekdays: number[]
+  times: string[]
+  interval_value: number
+  interval_unit: BackupIntervalUnit
+}
+
+export interface BackupCleanupConfig {
+  retention_days_enabled: boolean
+  retention_days: number
+  max_files_enabled: boolean
+  max_files: number
+}
+
+export interface BackupStorageConfig {
+  local_dir: string
+}
+
+export interface BackupConfig {
+  enabled: boolean
+  components: BackupComponentKey[]
+  schedule: BackupScheduleConfig
+  cleanup: BackupCleanupConfig
+  storage: BackupStorageConfig
+  last_run_at: string
+  last_run_key: string
+}
+
+export interface BackupLocalFile {
+  name: string
+  size: number
+  modified_at: string
+  backup_kind?: BackupKind | null
+  components: BackupComponentKey[]
+  counts: Record<string, number>
+  pre_restore: boolean
+  valid: boolean
+  error: string
+}
+
+export interface BackupExportLocalResponse {
+  file: BackupLocalFile
+}
+
+export interface BackupImportComponentPreview {
+  key: BackupComponentKey
+  label: string
+  records: number
+  sensitive: boolean
+}
+
+export interface BackupImportPreview {
+  filename?: string | null
+  backup_kind: BackupKind
+  format_version: number
+  simadmin_version: string
+  created_at: string
+  contains_sensitive_data: boolean
+  components: BackupImportComponentPreview[]
+  warnings: string[]
+}
+
+export interface BackupImportApplyResponse {
+  imported_components: BackupComponentKey[]
+  backup_kind: BackupKind
+  mode: BackupImportMode
+  pre_restore_file?: BackupLocalFile | null
+}
+
+export interface BackupLocalFilesResponse {
+  backups: BackupLocalFile[]
+  pre_restore: BackupLocalFile[]
+}
+
+export interface BackupBlobResponse {
+  blob: Blob
+  filename: string
+}
+export interface HubConfig {
+  enabled: boolean
+  url: string
+  local_fallback_timeout_seconds: number
+  local_fallback_enabled: boolean
+}
+
+export interface HubRuntimeStatus {
+  enabled: boolean
+  online: boolean
+  connection_state: 'disabled' | 'waiting_for_hub' | 'registering' | 'awaiting_approval' | 'connecting' | 'connected' | 'offline'
+  hub_url: string | null
+  hub_instance_id: string | null
+  hub_version: string | null
+  last_connected_at: string | null
+  agent_id: string | null
+  device_ids: string[]
+  local_fallback_state: 'inactive' | 'disabled' | 'armed' | 'active' | 'standby'
+  last_error: string | null
+}
+
+export interface HubSettingsResponse {
+  config: HubConfig
+  runtime: HubRuntimeStatus
 }

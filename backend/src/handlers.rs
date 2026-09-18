@@ -10,43 +10,39 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fs;
 use std::process::{Command, Output};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
+use std::time::Duration;
 use tracing::{error, info, warn};
 use zbus::Connection;
 
 use crate::{
     config::ApnConfig,
+    db::{Database, EsimEuiccCacheEntry, EsimProfileCacheEntry},
     esim::EsimApiError,
     models::*,
     modem_manager::{
-        self, answer_call, apply_roaming_policy, current_sim_identity,
-        find_nm_modem_connection_pub, get_airplane_mode, get_band_lock_status,
-        get_baseband_restart_progress, get_call_by_path, get_call_settings, get_cell_location,
-        get_cells_data, get_data_connection_status, get_device_info_data, get_is_roaming_mm,
-        get_network_info_data, get_operators_list, get_radio_mode, get_signal_strength,
-        get_sim_info_data_with_cache, hangup_all_calls, hangup_call, list_apn_contexts,
-        list_current_calls, make_call, nm_set_autoconnect_pub, power_cycle_sim_for_profile_switch,
-        refresh_sim_details_background, register_operator_auto, register_operator_manual,
-        restart_baseband, scan_operators, send_sms, set_airplane_mode, set_apn_on_bearer,
-        set_band_lock, set_call_waiting, set_data_connection_with_apn, set_radio_mode,
-        sim_details_cache_missing, start_cell_monitoring, stop_cell_monitoring,
+        self, answer_call, apply_roaming_policy, cached_own_numbers_for_identity,
+        cached_smsc_for_identity, current_sim_identity, find_nm_modem_connection_pub,
+        get_airplane_mode, get_band_lock_status, get_baseband_restart_progress, get_call_by_path,
+        get_call_settings, get_cell_location, get_cells_data, get_data_connection_status,
+        get_device_info_data, get_is_roaming_mm, get_network_info_data, get_operators_list,
+        get_radio_mode, get_signal_strength, get_sim_info_data_with_cache, hangup_all_calls,
+        hangup_call, list_apn_contexts, list_current_calls, make_call, nm_set_autoconnect_pub,
+        power_cycle_sim_for_profile_switch, refresh_sim_details_background, register_operator_auto,
+        register_operator_manual, restart_baseband, scan_operators, send_sms, set_airplane_mode,
+        set_apn_on_bearer, set_band_lock, set_call_waiting, set_data_connection_with_apn,
+        set_radio_mode, sim_details_cache_missing, start_cell_monitoring, stop_cell_monitoring,
     },
     state::AppState,
     system_event::{
         codes as system_event_codes, mask_identifier, severity as system_event_severity,
         status as system_event_status,
     },
-    utils::{
-        connection_addresses_from_interfaces, format_uptime, get_active_interfaces, read_cpu_info,
-        read_cpu_load_sync, read_disk_info, read_interface_stats, read_memory_info,
-        read_network_interfaces, read_system_info, read_uptime, sample_cpu_usage,
-    },
+    utils::read_cpu_info,
 };
 
 const ESIM_SIM_IDENTITY_TIMEOUT_SECS: u64 = 3;
@@ -90,11 +86,55 @@ fn esim_command_succeeded(response: &EsimCommandResponse) -> bool {
             || response.status.eq_ignore_ascii_case("ok"))
 }
 
+fn esim_command_failure(action: &str, message: impl Into<String>) -> EsimCommandResponse {
+    EsimCommandResponse {
+        code: 1,
+        status: "error".to_string(),
+        action: action.to_string(),
+        msg: message.into(),
+        data: None,
+    }
+}
+
+fn esim_enable_success(message: impl Into<String>) -> EsimCommandResponse {
+    EsimCommandResponse {
+        code: 0,
+        status: "ok".to_string(),
+        action: "enable".to_string(),
+        msg: message.into(),
+        data: None,
+    }
+}
+
 fn esim_profile_is_active(profile: &EsimProfile) -> bool {
     matches!(
         profile.state.trim().to_ascii_lowercase().as_str(),
         "enabled" | "active" | "1" | "true"
     )
+}
+
+fn esim_profile_matches_iccid(profile: &EsimProfile, normalized_iccid: &str) -> bool {
+    !normalized_iccid.is_empty()
+        && crate::utils::normalize_iccid(&profile.iccid) == normalized_iccid
+}
+
+fn esim_enable_failure_is_retryable(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "es10c_enable_profile",
+        "apdu",
+        "busy",
+        "catbusy",
+        "cat_busy",
+        "logical channel",
+        "uim",
+        "qmi",
+        "refresh",
+        "timeout",
+        "timed out",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
 }
 
 fn esim_profile_state_is_unknown(state: &str) -> bool {
@@ -117,6 +157,11 @@ fn sort_esim_profiles_for_display(profiles: &mut [EsimProfile]) {
     });
 }
 
+fn esim_profile_sim_details_missing(profile: &EsimProfile) -> bool {
+    profile.msisdn.as_deref().unwrap_or("").trim().is_empty()
+        || profile.smsc.as_deref().unwrap_or("").trim().is_empty()
+}
+
 fn split_profile_operator_code(code: &str) -> (String, String) {
     let digits: String = code.chars().filter(|ch| ch.is_ascii_digit()).collect();
     if digits.len() >= 6 {
@@ -131,6 +176,7 @@ fn split_profile_operator_code(code: &str) -> (String, String) {
 fn enrich_profiles_with_current_identity(
     profiles: &mut [EsimProfile],
     identity: &crate::modem_manager::SimIdentity,
+    db: Option<&Database>,
 ) {
     let current_index = profiles
         .iter()
@@ -155,6 +201,22 @@ fn enrich_profiles_with_current_identity(
     }
     if profile.mnc.is_none() && !mnc.is_empty() {
         profile.mnc = Some(mnc);
+    }
+    if let Some(db) = db {
+        if profile.msisdn.as_deref().unwrap_or("").trim().is_empty() {
+            if let Some(phone_number) = cached_own_numbers_for_identity(db, identity)
+                .into_iter()
+                .find(|value| !value.trim().is_empty())
+            {
+                profile.msisdn = Some(phone_number);
+            }
+        }
+        if profile.smsc.as_deref().unwrap_or("").trim().is_empty() {
+            let sms_center = cached_smsc_for_identity(db, identity);
+            if !sms_center.trim().is_empty() {
+                profile.smsc = Some(sms_center);
+            }
+        }
     }
 
     if !identity.iccid.is_empty() {
@@ -289,6 +351,257 @@ fn cached_profiles_requested(query: &std::collections::HashMap<String, String>) 
 
 // ============ 工作模式 / eSIM ============
 
+#[derive(Debug)]
+enum EsimRspNotificationScope {
+    Download {
+        target_iccid: Option<String>,
+    },
+    Enable {
+        target_iccid: String,
+        previous_iccids: HashSet<String>,
+    },
+}
+
+impl EsimRspNotificationScope {
+    fn target_iccid(&self) -> Option<&str> {
+        match self {
+            Self::Download { target_iccid } => target_iccid.as_deref(),
+            Self::Enable { target_iccid, .. } => Some(target_iccid),
+        }
+    }
+
+    fn event_entity(&self, notifications: &[EsimRspNotification]) -> String {
+        self.target_iccid()
+            .map(mask_identifier)
+            .or_else(|| {
+                notifications.iter().find_map(|notification| {
+                    let iccid = crate::utils::normalize_iccid(&notification.iccid);
+                    (!iccid.is_empty()).then(|| mask_identifier(&iccid))
+                })
+            })
+            .unwrap_or_else(|| "esim".to_string())
+    }
+}
+
+#[derive(Debug)]
+struct EsimRspNotificationSelection {
+    notifications: Vec<EsimRspNotification>,
+    expected_target_found: bool,
+}
+
+fn select_new_rsp_notifications(
+    before_sequences: &HashSet<u64>,
+    notifications: Vec<EsimRspNotification>,
+    scope: &EsimRspNotificationScope,
+) -> EsimRspNotificationSelection {
+    let new_notifications = notifications
+        .into_iter()
+        .filter(|notification| !before_sequences.contains(&notification.sequence_number))
+        .collect::<Vec<_>>();
+
+    let inferred_download_iccid = match scope {
+        EsimRspNotificationScope::Download { target_iccid: None } => {
+            let iccids = new_notifications
+                .iter()
+                .filter(|notification| {
+                    notification
+                        .operation
+                        .trim()
+                        .eq_ignore_ascii_case("install")
+                })
+                .map(|notification| crate::utils::normalize_iccid(&notification.iccid))
+                .filter(|iccid| !iccid.is_empty())
+                .collect::<HashSet<_>>();
+            (iccids.len() == 1)
+                .then(|| iccids.into_iter().next())
+                .flatten()
+        }
+        _ => None,
+    };
+
+    let mut selected = new_notifications
+        .into_iter()
+        .filter(|notification| {
+            let operation = notification.operation.trim().to_ascii_lowercase();
+            let iccid = crate::utils::normalize_iccid(&notification.iccid);
+            match scope {
+                EsimRspNotificationScope::Download { target_iccid } => {
+                    let target_iccid = target_iccid.as_ref().or(inferred_download_iccid.as_ref());
+                    operation == "install"
+                        && target_iccid
+                            .map(|target_iccid| iccid == *target_iccid)
+                            .unwrap_or(false)
+                }
+                EsimRspNotificationScope::Enable {
+                    target_iccid,
+                    previous_iccids,
+                } => {
+                    (operation == "enable" && iccid == *target_iccid)
+                        || (operation == "disable" && previous_iccids.contains(&iccid))
+                }
+            }
+        })
+        .collect::<Vec<_>>();
+    selected.sort_by_key(|notification| notification.sequence_number);
+    selected.dedup_by_key(|notification| notification.sequence_number);
+
+    let expected_target_found = selected.iter().any(|notification| {
+        let operation = notification.operation.trim();
+        let iccid = crate::utils::normalize_iccid(&notification.iccid);
+        match scope {
+            EsimRspNotificationScope::Download { .. } => operation.eq_ignore_ascii_case("install"),
+            EsimRspNotificationScope::Enable { target_iccid, .. } => {
+                operation.eq_ignore_ascii_case("enable") && iccid == *target_iccid
+            }
+        }
+    });
+
+    EsimRspNotificationSelection {
+        notifications: selected,
+        expected_target_found,
+    }
+}
+
+async fn capture_rsp_notification_sequences(app: &AppState) -> Option<HashSet<u64>> {
+    match app.esim_supervisor.get_rsp_notifications().await {
+        Ok(notifications) => Some(
+            notifications
+                .into_iter()
+                .map(|notification| notification.sequence_number)
+                .collect(),
+        ),
+        Err(err) => {
+            warn!(
+                error = %err.message(),
+                "Skipping automatic RSP notification delivery because the pre-operation snapshot failed"
+            );
+            None
+        }
+    }
+}
+
+async fn capture_enabled_profile_iccids(app: &AppState) -> HashSet<String> {
+    match app.esim_supervisor.get_profiles_for_switch().await {
+        Ok(response) => response
+            .profiles
+            .into_iter()
+            .filter(esim_profile_is_active)
+            .map(|profile| crate::utils::normalize_iccid(&profile.iccid))
+            .filter(|iccid| !iccid.is_empty())
+            .collect(),
+        Err(err) => {
+            warn!(
+                error = %err.message(),
+                "Could not capture the enabled Profile before RSP notification delivery"
+            );
+            HashSet::new()
+        }
+    }
+}
+
+async fn deliver_new_rsp_notifications(
+    app: &AppState,
+    before_sequences: Option<HashSet<u64>>,
+    scope: EsimRspNotificationScope,
+) {
+    let Some(before_sequences) = before_sequences else {
+        let event_entity = scope.event_entity(&[]);
+        warn!(
+            target = %event_entity,
+            "RSP notification delivery skipped because the pre-operation snapshot failed"
+        );
+        app.system_event_emitter
+            .emit_code(
+                system_event_codes::ESIM_RSP_NOTIFICATION_DELIVERY_FAILED,
+                system_event_severity::WARNING,
+                system_event_status::FAILED,
+                event_entity,
+                "Profile 操作成功，但操作前通知快照失败，已跳过自动提交",
+            )
+            .await;
+        return;
+    };
+
+    let notifications = match app.esim_supervisor.get_rsp_notifications().await {
+        Ok(notifications) => notifications,
+        Err(err) => {
+            let event_entity = scope.event_entity(&[]);
+            warn!(
+                target = %event_entity,
+                error = %err.message(),
+                "Failed to read RSP notifications after a successful Profile operation"
+            );
+            app.system_event_emitter
+                .emit_code(
+                    system_event_codes::ESIM_RSP_NOTIFICATION_DELIVERY_FAILED,
+                    system_event_severity::WARNING,
+                    system_event_status::FAILED,
+                    event_entity,
+                    "Profile 操作成功，但无法读取待提交的运营商通知",
+                )
+                .await;
+            return;
+        }
+    };
+
+    let selection = select_new_rsp_notifications(&before_sequences, notifications, &scope);
+    let event_entity = scope.event_entity(&selection.notifications);
+    let mut delivery_failed = !selection.expected_target_found;
+    if !selection.expected_target_found {
+        warn!(
+            target = %event_entity,
+            "Expected RSP notification was not found after a successful Profile operation"
+        );
+    }
+
+    for notification in selection.notifications {
+        if let Err(err) = app
+            .esim_supervisor
+            .process_rsp_notification(notification.sequence_number)
+            .await
+        {
+            delivery_failed = true;
+            warn!(
+                sequence_number = notification.sequence_number,
+                target = %event_entity,
+                error = %err.message(),
+                "Failed to deliver a new RSP notification; keeping it on the eUICC"
+            );
+            continue;
+        }
+
+        if let Err(err) = app
+            .esim_supervisor
+            .remove_rsp_notification(notification.sequence_number)
+            .await
+        {
+            delivery_failed = true;
+            warn!(
+                sequence_number = notification.sequence_number,
+                target = %event_entity,
+                error = %err.message(),
+                "RSP notification was delivered but could not be removed from the eUICC"
+            );
+        }
+    }
+
+    if delivery_failed {
+        app.system_event_emitter
+            .emit_code(
+                system_event_codes::ESIM_RSP_NOTIFICATION_DELIVERY_FAILED,
+                system_event_severity::WARNING,
+                system_event_status::FAILED,
+                event_entity,
+                if selection.expected_target_found {
+                    "Profile 操作成功，但部分运营商通知仍保留在 eUICC 中"
+                } else {
+                    "Profile 操作成功，但未找到与本次操作匹配的运营商通知"
+                },
+            )
+            .await;
+    }
+}
+
 fn live_refresh_requested(query: &std::collections::HashMap<String, String>) -> bool {
     query
         .get("live")
@@ -299,6 +612,270 @@ fn live_refresh_requested(query: &std::collections::HashMap<String, String>) -> 
             )
         })
         .unwrap_or(false)
+}
+
+enum EsimProfileEnableOutcome {
+    Enabled(EsimCommandResponse),
+    AlreadyEnabled(EsimCommandResponse),
+    Failed(EsimCommandResponse),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct EsimProfileEnableAttempt {
+    identifier: String,
+    identifier_kind: &'static str,
+    refresh: bool,
+}
+
+fn esim_profile_aid(profile: &EsimProfile) -> Option<String> {
+    profile.isdp_aid.as_deref().and_then(normalize_isdp_aid)
+}
+
+fn normalize_isdp_aid(value: &str) -> Option<String> {
+    let value = value.trim();
+    let value = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .unwrap_or(value);
+    let aid = value
+        .chars()
+        .filter(|character| !character.is_ascii_whitespace())
+        .collect::<String>();
+    let valid_length = (10..=32).contains(&aid.len()) && aid.len() % 2 == 0;
+    (valid_length && aid.chars().all(|character| character.is_ascii_hexdigit()))
+        .then(|| aid.to_ascii_uppercase())
+}
+
+fn fallback_enable_attempts(iccid: &str, isdp_aid: Option<&str>) -> Vec<EsimProfileEnableAttempt> {
+    let mut attempts = vec![EsimProfileEnableAttempt {
+        identifier: iccid.to_string(),
+        identifier_kind: "ICCID",
+        refresh: false,
+    }];
+
+    if let Some(aid) = isdp_aid.and_then(normalize_isdp_aid) {
+        attempts.extend(
+            [true, false]
+                .into_iter()
+                .map(|refresh| EsimProfileEnableAttempt {
+                    identifier: aid.clone(),
+                    identifier_kind: "AID",
+                    refresh,
+                }),
+        );
+    }
+
+    attempts
+}
+
+async fn refresh_profile_for_switch(
+    app: &AppState,
+    normalized_iccid: &str,
+) -> Result<Option<EsimProfile>, EsimApiError> {
+    let response = app.esim_supervisor.get_profiles_for_switch().await?;
+    Ok(response
+        .profiles
+        .into_iter()
+        .find(|profile| esim_profile_matches_iccid(profile, normalized_iccid)))
+}
+
+async fn retry_enable_profile_after_refresh(
+    app: &AppState,
+    iccid: &str,
+    normalized_iccid: &str,
+    first_message: String,
+    initial_isdp_aid: Option<String>,
+) -> Result<EsimProfileEnableOutcome, EsimApiError> {
+    modem_manager::record_restart_step(
+        "检查 eUICC 切卡状态",
+        "running",
+        Some("首次启用未确认成功，短暂刷新后自动重试".to_string()),
+    );
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    let mut isdp_aid = initial_isdp_aid;
+    match refresh_profile_for_switch(app, normalized_iccid).await {
+        Ok(Some(profile)) if esim_profile_is_active(&profile) => {
+            modem_manager::record_restart_step(
+                "检查 eUICC 切卡状态",
+                "ok",
+                Some("刷新后已检测到目标 Profile 生效".to_string()),
+            );
+            return Ok(EsimProfileEnableOutcome::Enabled(esim_enable_success(
+                "Profile enabled after status refresh",
+            )));
+        }
+        Ok(Some(profile)) => {
+            isdp_aid = isdp_aid.or_else(|| esim_profile_aid(&profile));
+            modem_manager::record_restart_step(
+                "检查 eUICC 切卡状态",
+                "ok",
+                Some("目标 Profile 仍未启用，使用兼容参数重试".to_string()),
+            );
+        }
+        Ok(None) => modem_manager::record_restart_step(
+            "检查 eUICC 切卡状态",
+            "warning",
+            Some("刷新后暂未返回目标 Profile，继续尝试兼容重试".to_string()),
+        ),
+        Err(err) => modem_manager::record_restart_step(
+            "检查 eUICC 切卡状态",
+            "warning",
+            Some(format!("刷新失败，继续尝试兼容重试: {}", err.message())),
+        ),
+    }
+
+    let attempts = fallback_enable_attempts(iccid, isdp_aid.as_deref());
+    let mut last_message = first_message;
+
+    for attempt in attempts {
+        let refresh_flag = if attempt.refresh { 1 } else { 0 };
+        modem_manager::record_restart_step(
+            "重试启用 eSIM Profile",
+            "running",
+            Some(format!(
+                "使用 {} + refreshFlag={} 兼容 eUICC 切换",
+                attempt.identifier_kind, refresh_flag
+            )),
+        );
+
+        let result = app
+            .esim_supervisor
+            .enable_profile_with_refresh_flag(attempt.identifier, attempt.refresh)
+            .await;
+        let retryable = match result {
+            Ok(data) if esim_command_succeeded(&data) => {
+                modem_manager::record_restart_step("重试启用 eSIM Profile", "ok", None);
+                return Ok(EsimProfileEnableOutcome::Enabled(data));
+            }
+            Ok(data) => {
+                let attempt_message = if data.msg.is_empty() {
+                    "enable command failed".to_string()
+                } else {
+                    data.msg
+                };
+                last_message = format!("{last_message}; retry failed: {attempt_message}");
+                esim_enable_failure_is_retryable(&attempt_message)
+            }
+            Err(err) => {
+                let attempt_message = err.message();
+                last_message = format!("{last_message}; retry failed: {attempt_message}");
+                esim_enable_failure_is_retryable(&attempt_message)
+            }
+        };
+
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        if matches!(
+            refresh_profile_for_switch(app, normalized_iccid).await,
+            Ok(Some(profile)) if esim_profile_is_active(&profile)
+        ) {
+            modem_manager::record_restart_step(
+                "检查 eUICC 切卡状态",
+                "ok",
+                Some("刷新后已检测到目标 Profile 生效".to_string()),
+            );
+            return Ok(EsimProfileEnableOutcome::Enabled(esim_enable_success(
+                "Profile enabled after status refresh",
+            )));
+        }
+
+        if !retryable {
+            break;
+        }
+    }
+
+    modem_manager::record_restart_step(
+        "重试启用 eSIM Profile",
+        "error",
+        Some(last_message.clone()),
+    );
+    Ok(EsimProfileEnableOutcome::Failed(esim_command_failure(
+        "enable",
+        last_message,
+    )))
+}
+
+async fn enable_esim_profile_for_switch(
+    app: &AppState,
+    iccid: &str,
+) -> Result<EsimProfileEnableOutcome, EsimApiError> {
+    let normalized_iccid = crate::utils::normalize_iccid(iccid);
+    if normalized_iccid.is_empty() {
+        let message = "Profile ICCID is empty".to_string();
+        modem_manager::record_restart_step(
+            "同步 eUICC Profile 状态",
+            "error",
+            Some(message.clone()),
+        );
+        return Ok(EsimProfileEnableOutcome::Failed(esim_command_failure(
+            "enable", message,
+        )));
+    }
+
+    modem_manager::record_restart_step("同步 eUICC Profile 状态", "running", None);
+    let mut isdp_aid = None;
+    match refresh_profile_for_switch(app, &normalized_iccid).await {
+        Ok(Some(profile)) if esim_profile_is_active(&profile) => {
+            modem_manager::record_restart_step(
+                "同步 eUICC Profile 状态",
+                "ok",
+                Some("目标 Profile 已是启用状态".to_string()),
+            );
+            return Ok(EsimProfileEnableOutcome::AlreadyEnabled(
+                esim_enable_success("Profile already enabled"),
+            ));
+        }
+        Ok(Some(profile)) => {
+            isdp_aid = esim_profile_aid(&profile);
+            modem_manager::record_restart_step(
+                "同步 eUICC Profile 状态",
+                "ok",
+                Some("目标 Profile 已确认，开始切换".to_string()),
+            );
+        }
+        Ok(None) => {
+            let message = "目标 Profile 未在 eUICC 芯片中找到，请刷新列表后重试".to_string();
+            modem_manager::record_restart_step(
+                "同步 eUICC Profile 状态",
+                "error",
+                Some(message.clone()),
+            );
+            return Ok(EsimProfileEnableOutcome::Failed(esim_command_failure(
+                "enable", message,
+            )));
+        }
+        Err(err) => modem_manager::record_restart_step(
+            "同步 eUICC Profile 状态",
+            "warning",
+            Some(format!("预刷新失败，继续尝试切卡: {}", err.message())),
+        ),
+    }
+
+    match app.esim_supervisor.enable_profile(iccid.to_string()).await {
+        Ok(data) if esim_command_succeeded(&data) => Ok(EsimProfileEnableOutcome::Enabled(data)),
+        Ok(data) if esim_enable_failure_is_retryable(&data.msg) => {
+            retry_enable_profile_after_refresh(
+                app,
+                iccid,
+                &normalized_iccid,
+                data.msg.clone(),
+                isdp_aid,
+            )
+            .await
+        }
+        Ok(data) => Ok(EsimProfileEnableOutcome::Failed(data)),
+        Err(err) if esim_enable_failure_is_retryable(&err.message()) => {
+            retry_enable_profile_after_refresh(
+                app,
+                iccid,
+                &normalized_iccid,
+                err.message(),
+                isdp_aid,
+            )
+            .await
+        }
+        Err(err) => Err(err),
+    }
 }
 
 fn euicc_cache_key(info: &EsimEuiccInfo) -> String {
@@ -351,7 +928,8 @@ fn euicc_from_cache_entry(entry: EsimEuiccCacheEntry) -> EsimEuiccInfo {
 /// GET /api/work-mode
 pub async fn get_work_mode_handler(State(app): State<AppState>) -> impl IntoResponse {
     let mode = app.config_manager.get_work_mode();
-    let worker_running = app.esim_supervisor.worker_running().await;
+    let esim_supported = app.esim_supervisor.esim_supported().await;
+    let worker_running = mode == WorkMode::Esim && esim_supported;
     (
         StatusCode::OK,
         Json(ApiResponse::success_with_message(
@@ -359,6 +937,7 @@ pub async fn get_work_mode_handler(State(app): State<AppState>) -> impl IntoResp
             WorkModeResponse {
                 mode,
                 worker_running,
+                esim_supported,
             },
         )),
     )
@@ -454,6 +1033,10 @@ pub async fn repair_esim_lpac_handler(
 
 /// GET /api/esim/config
 pub async fn get_esim_config_handler(State(app): State<AppState>) -> impl IntoResponse {
+    if let Err(err) = app.esim_supervisor.ensure_lpac_supported().await {
+        return esim_error_response::<crate::config::EsimConfig>(err);
+    }
+
     let esim_config = app.config_manager.get_esim_config();
     (
         StatusCode::OK,
@@ -466,6 +1049,10 @@ pub async fn set_esim_config_handler(
     State(app): State<AppState>,
     Json(payload): Json<crate::config::EsimConfig>,
 ) -> impl IntoResponse {
+    if let Err(err) = app.esim_supervisor.ensure_lpac_supported().await {
+        return esim_error_response::<()>(err);
+    }
+
     match app.config_manager.set_esim_config(payload) {
         Ok(_) => (
             StatusCode::OK,
@@ -486,6 +1073,10 @@ pub async fn get_esim_euicc_handler(
     State(app): State<AppState>,
     Query(query): Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
+    if let Err(err) = app.esim_supervisor.ensure_lpac_supported().await {
+        return esim_error_response::<EsimEuiccInfo>(err);
+    }
+
     if !live_refresh_requested(&query) {
         match app.database.latest_esim_euicc_cache() {
             Ok(Some(entry)) => {
@@ -525,14 +1116,20 @@ pub async fn get_esim_profiles_handler(
     State(app): State<AppState>,
     Query(query): Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
+    if let Err(err) = app.esim_supervisor.ensure_lpac_supported().await {
+        return esim_error_response::<EsimProfilesResponse>(err);
+    }
+
     if cached_profiles_requested(&query) {
         return match app.database.list_esim_profile_cache() {
             Ok(entries) => {
                 let mut profiles: Vec<EsimProfile> =
                     entries.into_iter().map(profile_from_cache_entry).collect();
-                let needs_identity = profiles
-                    .iter()
-                    .any(|profile| esim_profile_state_is_unknown(&profile.state));
+                let needs_identity = profiles.iter().any(|profile| {
+                    esim_profile_state_is_unknown(&profile.state)
+                        || esim_profile_is_active(profile)
+                            && esim_profile_sim_details_missing(profile)
+                });
                 if needs_identity {
                     match tokio::time::timeout(
                         std::time::Duration::from_millis(ESIM_CACHED_SIM_IDENTITY_TIMEOUT_MS),
@@ -541,7 +1138,12 @@ pub async fn get_esim_profiles_handler(
                     .await
                     {
                         Ok(Some(identity)) => {
-                            enrich_profiles_with_current_identity(&mut profiles, &identity)
+                            enrich_profiles_with_current_identity(
+                                &mut profiles,
+                                &identity,
+                                Some(app.database.as_ref()),
+                            );
+                            cache_esim_profiles(&app.database, &profiles);
                         }
                         Ok(None) => {}
                         Err(_) => warn!(
@@ -577,9 +1179,11 @@ pub async fn get_esim_profiles_handler(
             )
             .await
             {
-                Ok(Some(identity)) => {
-                    enrich_profiles_with_current_identity(&mut data.profiles, &identity)
-                }
+                Ok(Some(identity)) => enrich_profiles_with_current_identity(
+                    &mut data.profiles,
+                    &identity,
+                    Some(app.database.as_ref()),
+                ),
                 Ok(None) => {}
                 Err(_) => warn!(
                     timeout_secs = ESIM_SIM_IDENTITY_TIMEOUT_SECS,
@@ -602,6 +1206,10 @@ pub async fn enable_esim_profile_handler(
     State(app): State<AppState>,
     Path(iccid): Path<String>,
 ) -> impl IntoResponse {
+    if let Err(err) = app.esim_supervisor.ensure_lpac_supported().await {
+        return esim_error_response::<EsimCommandResponse>(err);
+    }
+
     let event_entity = mask_identifier(&iccid);
 
     modem_manager::reset_baseband_restart_progress();
@@ -613,9 +1221,11 @@ pub async fn enable_esim_profile_handler(
 
     tokio::spawn(async move {
         let _guard = modem_manager::BasebandRestartRunGuard;
+        let previous_iccids = capture_enabled_profile_iccids(&bg_app).await;
+        let rsp_notification_sequences = capture_rsp_notification_sequences(&bg_app).await;
 
-        match bg_app.esim_supervisor.enable_profile(bg_iccid).await {
-            Ok(data) => {
+        match enable_esim_profile_for_switch(&bg_app, &bg_iccid).await {
+            Ok(EsimProfileEnableOutcome::Enabled(data)) => {
                 if esim_command_succeeded(&data) {
                     modem_manager::record_restart_step("启用 eSIM Profile", "ok", None);
                     let auto_connect_data = !bg_app.data_user_disabled.load(Ordering::SeqCst);
@@ -669,6 +1279,16 @@ pub async fn enable_esim_profile_handler(
                             }
                         }
                     }
+
+                    deliver_new_rsp_notifications(
+                        &bg_app,
+                        rsp_notification_sequences,
+                        EsimRspNotificationScope::Enable {
+                            target_iccid: crate::utils::normalize_iccid(&bg_iccid),
+                            previous_iccids,
+                        },
+                    )
+                    .await;
                 } else {
                     modem_manager::record_restart_step(
                         "启用 eSIM Profile",
@@ -686,6 +1306,40 @@ pub async fn enable_esim_profile_handler(
                         )
                         .await;
                 }
+            }
+            Ok(EsimProfileEnableOutcome::AlreadyEnabled(data)) => {
+                modem_manager::record_restart_step(
+                    "启用 eSIM Profile",
+                    "ok",
+                    Some(data.msg.clone()),
+                );
+                bg_app
+                    .system_event_emitter
+                    .emit_code(
+                        system_event_codes::ESIM_PROFILE_ENABLE_SUCCEEDED,
+                        system_event_severity::INFO,
+                        system_event_status::SUCCEEDED,
+                        bg_event_entity.clone(),
+                        "Profile 已是启用状态，无需重复切换",
+                    )
+                    .await;
+            }
+            Ok(EsimProfileEnableOutcome::Failed(data)) => {
+                modem_manager::record_restart_step(
+                    "启用 eSIM Profile",
+                    "error",
+                    Some(data.msg.clone()),
+                );
+                bg_app
+                    .system_event_emitter
+                    .emit_code(
+                        system_event_codes::ESIM_PROFILE_ENABLE_FAILED,
+                        system_event_severity::WARNING,
+                        system_event_status::FAILED,
+                        bg_event_entity.clone(),
+                        format!("Profile 启用失败: {}", data.msg),
+                    )
+                    .await;
             }
             Err(err) => {
                 let message = err.message();
@@ -823,10 +1477,12 @@ pub async fn download_esim_profile_handler(
                 .map(|p| crate::utils::normalize_iccid(&p.iccid))
                 .collect()
         });
+    let rsp_notification_sequences = capture_rsp_notification_sequences(&app).await;
 
     match app.esim_supervisor.download_profile(payload.clone()).await {
         Ok(data) => {
             if esim_command_succeeded(&data) {
+                let downloaded_iccid;
                 // Attempt to recursively find the downloaded profile details in lpac's response
                 let profile_val = data.data.clone().unwrap_or(serde_json::Value::Null);
                 if let Some(mut profile) = find_and_normalize_profile(&profile_val) {
@@ -862,6 +1518,7 @@ pub async fn download_esim_profile_handler(
                         delete_allowed: profile.delete_allowed,
                         updated_at: chrono::Utc::now().to_rfc3339(),
                     };
+                    downloaded_iccid = Some(profile.iccid.clone());
 
                     if let Err(err) = app.database.upsert_esim_profile_cache(&entry) {
                         warn!(iccid = %entry.iccid, error = %err, "Failed to cache downloaded eSIM profile to database");
@@ -959,6 +1616,7 @@ pub async fn download_esim_profile_handler(
                         .as_ref()
                         .map(|iccid| mask_identifier(iccid))
                         .unwrap_or_else(|| "esim".to_string());
+                    downloaded_iccid = cached_fallback_iccid;
 
                     app.system_event_emitter
                         .emit_code(
@@ -970,6 +1628,19 @@ pub async fn download_esim_profile_handler(
                         )
                         .await;
                 }
+
+                let target_iccid = downloaded_iccid
+                    .map(|iccid| crate::utils::normalize_iccid(&iccid))
+                    .filter(|iccid| !iccid.is_empty());
+                let bg_app = app.clone();
+                tokio::spawn(async move {
+                    deliver_new_rsp_notifications(
+                        &bg_app,
+                        rsp_notification_sequences,
+                        EsimRspNotificationScope::Download { target_iccid },
+                    )
+                    .await;
+                });
             } else {
                 let msg = data.msg.clone();
                 let is_refused = msg.contains("MatchingID is refused")
@@ -1016,7 +1687,7 @@ pub async fn download_esim_profile_handler(
                                     delete_allowed: p.delete_allowed,
                                     updated_at: chrono::Utc::now().to_rfc3339(),
                                 };
-                                if let Ok(_) = app.database.upsert_esim_profile_cache(&entry) {
+                                if app.database.upsert_esim_profile_cache(&entry).is_ok() {
                                     cached_fallback_iccid = Some(p.iccid.clone());
                                     break;
                                 }
@@ -1198,7 +1869,7 @@ pub async fn update_sim_cache_handler(
         crate::modem_manager::cache_own_numbers_for_identity(
             &app.database,
             &identity,
-            &[phone_number.clone()],
+            std::slice::from_ref(phone_number),
             "manual",
         );
     }
@@ -1617,52 +2288,28 @@ pub async fn unlock_all_cells_handler(State(app): State<AppState>) -> impl IntoR
 
 /// GET /api/network/interfaces
 pub async fn get_network_interfaces_info(
-    State(dbus_conn): State<Arc<Connection>>,
+    State(_dbus_conn): State<Arc<Connection>>,
 ) -> impl IntoResponse {
-    match read_network_interfaces(Some(&dbus_conn)).await {
-        Ok(interfaces) => {
-            let total_count = interfaces.len();
-            (
-                StatusCode::OK,
-                Json(ApiResponse::success_with_message(
-                    "Success",
-                    NetworkInterfacesResponse {
-                        interfaces,
-                        total_count,
-                    },
-                )),
-            )
-        }
-        Err(e) => (
-            StatusCode::OK,
-            Json(ApiResponse::<NetworkInterfacesResponse>::error(format!(
-                "Failed: {}",
-                e
-            ))),
-        ),
-    }
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message(
+            "Success",
+            simadmin_device_runtime::network_interfaces(),
+        )),
+    )
 }
 
 /// GET /api/network/connection-addresses
 pub async fn get_network_connection_addresses(
-    State(dbus_conn): State<Arc<Connection>>,
+    State(_dbus_conn): State<Arc<Connection>>,
 ) -> impl IntoResponse {
-    match read_network_interfaces(Some(&dbus_conn)).await {
-        Ok(interfaces) => (
-            StatusCode::OK,
-            Json(ApiResponse::success_with_message(
-                "Success",
-                connection_addresses_from_interfaces(&interfaces),
-            )),
-        ),
-        Err(e) => (
-            StatusCode::OK,
-            Json(ApiResponse::<ConnectionAddressesResponse>::error(format!(
-                "Failed: {}",
-                e
-            ))),
-        ),
-    }
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message(
+            "Success",
+            simadmin_device_runtime::connection_addresses(),
+        )),
+    )
 }
 
 /// GET /api/device-network/ddns/config
@@ -1687,9 +2334,7 @@ pub async fn set_device_ddns_config_handler(
     if is_masked_secret(&payload.access_id) {
         payload.access_id = current.access_id;
     }
-    if payload.access_secret.trim().is_empty() {
-        payload.access_secret = current.access_secret;
-    } else if is_masked_secret(&payload.access_secret) {
+    if payload.access_secret.trim().is_empty() || is_masked_secret(&payload.access_secret) {
         payload.access_secret = current.access_secret;
     }
     if payload.interval_seconds == 0 {
@@ -2330,8 +2975,6 @@ pub async fn get_airplane_mode_handler(State(conn): State<Arc<Connection>>) -> i
 
 // ============ 短信功能 ============
 
-use crate::db::{Database, EsimEuiccCacheEntry, EsimProfileCacheEntry};
-
 fn schedule_sms_db_maintenance(app: &AppState, deleted: usize) {
     if deleted < SMS_DB_MAINTENANCE_DELETE_THRESHOLD {
         return;
@@ -2510,13 +3153,17 @@ pub async fn delete_sms_message_handler(
     Path(id): Path<i64>,
 ) -> (StatusCode, Json<ApiResponse<serde_json::Value>>) {
     match db.delete_sms(id) {
-        Ok(deleted) => (
+        Ok(deleted) => {
+            let _ = db.enqueue_sms_deleted(&[format!("sms-local-{}", id)]);
+            crate::hub_agent::hub_business_wakeup().notify_one();
+            (
             StatusCode::OK,
             Json(ApiResponse::success_with_message(
                 "SMS deleted",
                 json!({ "deleted": deleted }),
             )),
-        ),
+        )
+        }
         Err(e) => (
             StatusCode::OK,
             Json(ApiResponse::error(format!("Failed: {}", e))),
@@ -2529,9 +3176,15 @@ pub async fn delete_sms_conversation_handler(
     State(app): State<AppState>,
     Path(phone_number): Path<String>,
 ) -> (StatusCode, Json<ApiResponse<serde_json::Value>>) {
+    let phone_ids = app.database.get_sms_ids_by_phone(&phone_number).unwrap_or_default();
     match app.database.delete_sms_conversation(&phone_number) {
         Ok(deleted) => {
             schedule_sms_db_maintenance(&app, deleted);
+            if !phone_ids.is_empty() {
+                let items: Vec<String> = phone_ids.into_iter().map(|id| format!("sms-local-{}", id)).collect();
+                let _ = app.database.enqueue_sms_deleted(&items);
+                crate::hub_agent::hub_business_wakeup().notify_one();
+            }
             (
                 StatusCode::OK,
                 Json(ApiResponse::success_with_message(
@@ -2556,12 +3209,23 @@ pub async fn delete_sms_batch_handler(
         return (StatusCode::OK, Json(ApiResponse::error("No SMS selected")));
     }
 
+    let mut all_ids = payload.ids.clone();
+    for pn in &payload.phone_numbers {
+        if let Ok(ids) = app.database.get_sms_ids_by_phone(pn) {
+            all_ids.extend(ids);
+        }
+    }
     match app
         .database
         .delete_sms_batch(&payload.ids, &payload.phone_numbers)
     {
         Ok(deleted) => {
             schedule_sms_db_maintenance(&app, deleted);
+            if !all_ids.is_empty() {
+                let items: Vec<String> = all_ids.into_iter().map(|id| format!("sms-local-{}", id)).collect();
+                let _ = app.database.enqueue_sms_deleted(&items);
+                crate::hub_agent::hub_business_wakeup().notify_one();
+            }
             (
                 StatusCode::OK,
                 Json(ApiResponse::success_with_message(
@@ -2579,7 +3243,6 @@ pub async fn delete_sms_batch_handler(
 
 // ============ 系统信息 ============
 
-/// 读取温度传感器数据
 // ============ 电话功能 ============
 
 async fn track_call_start(
@@ -3052,7 +3715,7 @@ pub(crate) fn temperature_sensor_label(sensor_type: &str, zone: &str) -> String 
     }
 
     let cleaned = source
-        .replace(|ch: char| matches!(ch, '-' | '_' | ' '), " ")
+        .replace(['-', '_', ' '], " ")
         .split_whitespace()
         .filter(|part| {
             !matches!(
@@ -3145,146 +3808,30 @@ pub(crate) fn read_temperature_sensors() -> Vec<ThermalZone> {
     sensors
 }
 
-static SYSTEM_STATS_SNAPSHOT: OnceLock<Arc<RwLock<Option<SystemStatsResponse>>>> = OnceLock::new();
-const SYSTEM_STATS_LOW_FREQUENCY_REFRESH_SECS: u64 = 10;
+static SYSTEM_RUNTIME: OnceLock<simadmin_device_runtime::SystemRuntime> = OnceLock::new();
 
-#[derive(Default)]
-struct SystemStatsSamplerState {
-    previous_network: HashMap<String, (u64, u64)>,
-    last_low_frequency_refresh: Option<Instant>,
-    memory: MemoryInfo,
-    disk: Vec<DiskInfo>,
-    uptime: UptimeInfo,
-    system_info: SystemInfo,
-    temperature: Vec<ThermalZone>,
+fn system_runtime() -> &'static simadmin_device_runtime::SystemRuntime {
+    SYSTEM_RUNTIME.get_or_init(simadmin_device_runtime::SystemRuntime::new)
 }
 
-fn system_stats_snapshot() -> Arc<RwLock<Option<SystemStatsResponse>>> {
-    Arc::clone(SYSTEM_STATS_SNAPSHOT.get_or_init(|| Arc::new(RwLock::new(None))))
-}
-
-async fn collect_system_stats_snapshot(
-    dbus_conn: &Connection,
-    state: &mut SystemStatsSamplerState,
-    interval_seconds: f64,
-) -> Result<SystemStatsResponse, String> {
-    let interfaces =
-        get_active_interfaces().map_err(|e| format!("Failed to get interfaces: {}", e))?;
-
-    let mut speed_data = Vec::new();
-    let elapsed = interval_seconds.max(0.001);
-    for iface in &interfaces {
-        if let Ok((rx, tx)) = read_interface_stats(iface, Some(dbus_conn)).await {
-            let (rx_speed, tx_speed) = state
-                .previous_network
-                .get(iface)
-                .map(|(prev_rx, prev_tx)| {
-                    (
-                        (rx.saturating_sub(*prev_rx) as f64 / elapsed) as u64,
-                        (tx.saturating_sub(*prev_tx) as f64 / elapsed) as u64,
-                    )
-                })
-                .unwrap_or((0, 0));
-            speed_data.push(NetworkSpeed {
-                interface: iface.clone(),
-                rx_bytes_per_sec: rx_speed,
-                tx_bytes_per_sec: tx_speed,
-                total_rx_bytes: rx,
-                total_tx_bytes: tx,
-            });
-            state.previous_network.insert(iface.clone(), (rx, tx));
-        }
-    }
-    state
-        .previous_network
-        .retain(|iface, _| interfaces.iter().any(|current| current == iface));
-
-    let cpu_usage = sample_cpu_usage().await.unwrap_or(0.0);
-    let mut cpu_load = read_cpu_load_sync().unwrap_or_default();
-    cpu_load.load_percent = cpu_usage;
-
-    let should_refresh_low_frequency = state
-        .last_low_frequency_refresh
-        .map(|last| last.elapsed() >= Duration::from_secs(SYSTEM_STATS_LOW_FREQUENCY_REFRESH_SECS))
-        .unwrap_or(true);
-    if should_refresh_low_frequency {
-        let (total, available, cached, buffers) = read_memory_info()?;
-        let used = total.saturating_sub(available);
-        let used_percent = if total > 0 {
-            (used as f64 / total as f64) * 100.0
-        } else {
-            0.0
-        };
-        let (uptime, idle) = read_uptime()?;
-        state.memory = MemoryInfo {
-            total_bytes: total,
-            available_bytes: available,
-            used_bytes: used,
-            used_percent,
-            cached_bytes: cached,
-            buffers_bytes: buffers,
-        };
-        state.disk = read_disk_info();
-        state.uptime = UptimeInfo {
-            uptime_seconds: uptime,
-            idle_seconds: idle,
-            uptime_formatted: format_uptime(uptime),
-        };
-        state.system_info = read_system_info()?;
-        state.temperature = read_temperature_sensors();
-        state.last_low_frequency_refresh = Some(Instant::now());
-    }
-
-    Ok(SystemStatsResponse {
-        network_speed: NetworkSpeedResponse {
-            interfaces: speed_data,
-            interval_seconds: elapsed,
-        },
-        memory: state.memory.clone(),
-        disk: state.disk.clone(),
-        cpu_load,
-        uptime: state.uptime.clone(),
-        system_info: state.system_info.clone(),
-        temperature: state.temperature.clone(),
-    })
-}
-
-pub fn spawn_system_stats_sampler(dbus_conn: Arc<Connection>) {
-    let snapshot = system_stats_snapshot();
-    tokio::spawn(async move {
-        let mut sampler_state = SystemStatsSamplerState::default();
-        let mut last_sample = Instant::now();
-        loop {
-            let elapsed = last_sample.elapsed().as_secs_f64().max(1.0);
-            last_sample = Instant::now();
-            match collect_system_stats_snapshot(&dbus_conn, &mut sampler_state, elapsed).await {
-                Ok(stats) => {
-                    *snapshot.write().await = Some(stats);
-                }
-                Err(err) => warn!(error = %err, "Failed to sample system stats"),
-            }
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
-    });
+pub fn spawn_system_stats_sampler(_dbus_conn: Arc<Connection>) {
+    let _ = system_runtime();
 }
 
 /// GET /api/stats
 pub async fn get_system_stats(State(_dbus_conn): State<Arc<Connection>>) -> impl IntoResponse {
-    let snapshot = system_stats_snapshot();
-    if let Some(data) = snapshot.read().await.clone() {
-        return (
+    match system_runtime().stats().await {
+        Ok(data) => (
             StatusCode::OK,
             Json(ApiResponse::success_with_message("Success", data)),
-        );
+        ),
+        Err(error) => (
+            StatusCode::OK,
+            Json(ApiResponse::<SystemStatsResponse>::error(format!(
+                "Failed: {error}"
+            ))),
+        ),
     }
-
-    (
-        StatusCode::OK,
-        Json(ApiResponse::success_with_message(
-            "No system stats sample yet",
-            SystemStatsResponse::default(),
-        )),
-    )
 }
 
 /// GET /api/stats/cpu
@@ -3304,77 +3851,17 @@ pub async fn get_cpu_info() -> impl IntoResponse {
 /// GET /api/connectivity
 pub async fn get_connectivity_check() -> (StatusCode, Json<ApiResponse<ConnectivityCheckResponse>>)
 {
-    // 两个 ping 并行执行，超时从 2s 缩短到 1s
-    let (ipv4_result, ipv6_result) = tokio::join!(
-        async_ping_host("223.5.5.5", false),
-        async_ping_host("2400:3200::1", true),
-    );
     (
         StatusCode::OK,
         Json(ApiResponse::success_with_message(
             "Connectivity check completed",
-            ConnectivityCheckResponse {
-                ipv4: ipv4_result,
-                ipv6: ipv6_result,
-            },
+            simadmin_device_runtime::connectivity().await,
         )),
     )
 }
 
 pub(crate) async fn async_ping_host(target: &str, is_ipv6: bool) -> PingResult {
-    let cmd = if is_ipv6 { "ping6" } else { "ping" };
-    let output = tokio::process::Command::new(cmd)
-        .args(["-c", "1", "-W", "1", target])
-        .output()
-        .await;
-    match output {
-        Ok(result) => {
-            if result.status.success() {
-                let stdout = String::from_utf8_lossy(&result.stdout);
-                let latency = parse_ping_latency(&stdout);
-                PingResult {
-                    success: true,
-                    latency_ms: latency,
-                    target: target.to_string(),
-                    error: None,
-                }
-            } else {
-                let stderr = String::from_utf8_lossy(&result.stderr);
-                PingResult {
-                    success: false,
-                    latency_ms: None,
-                    target: target.to_string(),
-                    error: Some(if stderr.is_empty() {
-                        "Unreachable".to_string()
-                    } else {
-                        stderr.trim().to_string()
-                    }),
-                }
-            }
-        }
-        Err(e) => PingResult {
-            success: false,
-            latency_ms: None,
-            target: target.to_string(),
-            error: Some(format!("Failed: {}", e)),
-        },
-    }
-}
-
-fn parse_ping_latency(output: &str) -> Option<f64> {
-    for line in output.lines() {
-        if let Some(time_pos) = line.find("time=") {
-            let after_time = &line[time_pos + 5..];
-            let num_str: String = after_time
-                .chars()
-                .take_while(|c| c.is_ascii_digit() || *c == '.')
-                .collect();
-            if let Ok(latency) = num_str.parse::<f64>() {
-                return Some(latency);
-            }
-        }
-    }
-    None
+    simadmin_device_runtime::ping_host(target, is_ipv6).await
 }
 
 /// POST /api/system/reboot
@@ -3415,19 +3902,8 @@ pub async fn run_safe_os_reboot_sequence(
 
     info!("Starting safe OS reboot sequence");
 
-    if let Some(message) =
-        run_reboot_prep_command("disable modem radio", "mmcli", &["-m", "0", "-d"], false)
-    {
-        system_events
-            .emit_code(
-                system_event_codes::SYSTEM_SERVICE_REBOOT_PREP_FAILED,
-                system_event_severity::WARNING,
-                system_event_status::FAILED,
-                "disable modem radio",
-                message,
-            )
-            .await;
-    }
+    // 尽力尝试让调制解调器优雅脱网并下电，使用 any 适配动态 Modem 序号，且设为允许容错（避免因已脱网或序号漂移产生非预期警告）
+    let _ = run_reboot_prep_command("disable modem radio", "mmcli", &["-m", "any", "-d"], true);
     if let Some(message) = run_reboot_prep_command(
         "stop ModemManager IPC service",
         "systemctl",
@@ -3713,15 +4189,15 @@ pub async fn get_notification_logs_handler(
     StatusCode,
     Json<ApiResponse<crate::db::NotificationLogsResponse>>,
 ) {
-    match database.get_notification_logs(
-        &query.event_type,
-        &query.status,
-        &query.q,
-        &query.start_date,
-        &query.end_date,
-        query.limit,
-        query.offset,
-    ) {
+    match database.get_notification_logs(crate::db::LogQuery {
+        kind: &query.event_type,
+        status: &query.status,
+        search: &query.q,
+        start_date: &query.start_date,
+        end_date: &query.end_date,
+        limit: query.limit,
+        offset: query.offset,
+    }) {
         Ok(logs) => (
             StatusCode::OK,
             Json(ApiResponse::success_with_message("Success", logs)),
@@ -3793,7 +4269,7 @@ pub async fn upload_ota_handler(body: axum::body::Bytes) -> impl IntoResponse {
 
 /// POST /api/ota/latest-release
 pub async fn get_latest_ota_release_handler(
-    Json(req): Json<crate::models::OtaOnlinePrepareRequest>,
+    Json(req): Json<crate::models::OtaLatestReleaseRequest>,
 ) -> impl IntoResponse {
     let result: Result<crate::models::OtaLatestReleaseResponse, String> = async {
         let include_builtin_proxies = req
@@ -3804,8 +4280,26 @@ pub async fn get_latest_ota_release_handler(
         let proxy_prefix = crate::ota::normalize_proxy_prefix(req.proxy_prefix);
         let client = crate::ota::build_ota_http_client()?;
 
-        crate::ota::fetch_latest_github_release(&client, &proxy_prefix, include_builtin_proxies)
-            .await
+        let mut release = crate::ota::fetch_latest_github_release(
+            &client,
+            &proxy_prefix,
+            include_builtin_proxies,
+        )
+        .await?;
+
+        let installed_status = crate::ota::get_ota_status();
+        let current_arch = installed_status
+            .current_arch
+            .clone()
+            .unwrap_or_else(crate::ota::resolve_current_target_triple);
+        release.assets = crate::ota::supported_release_assets_for_target(
+            &release,
+            &current_arch,
+            installed_status.current_edition.as_deref(),
+            req.include_variants,
+        );
+        release.supports_asset_selection = Some(true);
+        Ok(release)
     }
     .await;
 
@@ -3844,8 +4338,29 @@ pub async fn prepare_online_ota_handler(
         )
         .await?;
 
-        let asset = crate::ota::supported_release_asset(&release)
-            .ok_or_else(|| "No supported OTA asset found in latest release".to_string())?;
+        let installed_status = crate::ota::get_ota_status();
+        let target_edition = installed_status.current_edition.as_deref();
+        let current_arch = installed_status
+            .current_arch
+            .as_deref()
+            .ok_or_else(|| "Unable to determine current OTA target architecture".to_string())?;
+
+        let asset = if let Some(ref asset_name) = req.asset_name {
+            crate::ota::supported_release_asset_by_name_for_target(
+                &release,
+                current_arch,
+                asset_name,
+            )
+            .ok_or_else(|| {
+                format!(
+                    "Specified OTA asset '{}' was not found or is incompatible with architecture {}",
+                    asset_name, current_arch
+                )
+            })?
+        } else {
+            crate::ota::supported_release_asset(&release, target_edition)
+                .ok_or_else(|| "No supported OTA asset found in latest release".to_string())?
+        };
 
         if asset.size > crate::ota::MAX_OTA_BYTES {
             return Err(format!(
@@ -4006,15 +4521,15 @@ pub async fn get_automation_logs_handler(
     StatusCode,
     Json<ApiResponse<crate::db::AutomationLogsResponse>>,
 ) {
-    match database.get_automation_logs(
-        &query.task_type,
-        &query.status,
-        &query.q,
-        &query.start_date,
-        &query.end_date,
-        query.limit,
-        query.offset,
-    ) {
+    match database.get_automation_logs(crate::db::LogQuery {
+        kind: &query.task_type,
+        status: &query.status,
+        search: &query.q,
+        start_date: &query.start_date,
+        end_date: &query.end_date,
+        limit: query.limit,
+        offset: query.offset,
+    }) {
         Ok(logs) => (
             StatusCode::OK,
             Json(ApiResponse::success_with_message("Success", logs)),
@@ -4069,6 +4584,7 @@ pub async fn test_automation_task_handler(
         let task_type = match &task.action {
             crate::config::AutomationAction::RestartBaseband => "restart_baseband",
             crate::config::AutomationAction::RebootDevice { .. } => "reboot_device",
+            crate::config::AutomationAction::BackupData { .. } => "backup_data",
             crate::config::AutomationAction::SendSms { .. } => "send_sms",
         };
 
@@ -4088,6 +4604,15 @@ pub async fn test_automation_task_handler(
             crate::config::AutomationAction::RestartBaseband => serde_json::Value::Null,
             crate::config::AutomationAction::RebootDevice { delay_seconds } => {
                 serde_json::json!({ "delay_seconds": delay_seconds })
+            }
+            crate::config::AutomationAction::BackupData {
+                components,
+                storage,
+            } => {
+                serde_json::json!({
+                    "components": components,
+                    "storage": storage,
+                })
             }
             crate::config::AutomationAction::SendSms {
                 phone_number,
@@ -4150,6 +4675,173 @@ mod tests {
     use super::*;
     use crate::modem_manager::SimIdentity;
 
+    fn rsp_notification(sequence_number: u64, operation: &str, iccid: &str) -> EsimRspNotification {
+        EsimRspNotification {
+            sequence_number,
+            operation: operation.to_string(),
+            iccid: iccid.to_string(),
+        }
+    }
+
+    #[test]
+    fn selects_only_new_install_notification_for_downloaded_profile() {
+        const TARGET_ICCID: &str = "8900000000000000001";
+        const OTHER_ICCID: &str = "8900000000000000002";
+        let before_sequences = HashSet::from([10, 11]);
+        let notifications = vec![
+            rsp_notification(10, "install", TARGET_ICCID),
+            rsp_notification(12, "enable", TARGET_ICCID),
+            rsp_notification(13, "install", OTHER_ICCID),
+            rsp_notification(14, "install", TARGET_ICCID),
+        ];
+        let scope = EsimRspNotificationScope::Download {
+            target_iccid: Some(crate::utils::normalize_iccid(TARGET_ICCID)),
+        };
+
+        let selected = select_new_rsp_notifications(&before_sequences, notifications, &scope);
+
+        assert!(selected.expected_target_found);
+        assert_eq!(
+            selected
+                .notifications
+                .iter()
+                .map(|notification| notification.sequence_number)
+                .collect::<Vec<_>>(),
+            vec![14]
+        );
+    }
+
+    #[test]
+    fn selects_only_new_enable_and_previous_disable_notifications_for_switch() {
+        const TARGET_ICCID: &str = "8900000000000000001";
+        const PREVIOUS_ICCID: &str = "8900000000000000002";
+        const UNRELATED_ICCID: &str = "8900000000000000003";
+        let before_sequences = HashSet::from([20]);
+        let notifications = vec![
+            rsp_notification(25, "disable", UNRELATED_ICCID),
+            rsp_notification(24, "enable", TARGET_ICCID),
+            rsp_notification(23, "disable", PREVIOUS_ICCID),
+            rsp_notification(22, "install", TARGET_ICCID),
+            rsp_notification(20, "enable", TARGET_ICCID),
+        ];
+        let scope = EsimRspNotificationScope::Enable {
+            target_iccid: crate::utils::normalize_iccid(TARGET_ICCID),
+            previous_iccids: HashSet::from([crate::utils::normalize_iccid(PREVIOUS_ICCID)]),
+        };
+
+        let selected = select_new_rsp_notifications(&before_sequences, notifications, &scope);
+
+        assert!(selected.expected_target_found);
+        assert_eq!(
+            selected
+                .notifications
+                .iter()
+                .map(|notification| notification.sequence_number)
+                .collect::<Vec<_>>(),
+            vec![23, 24]
+        );
+    }
+
+    #[test]
+    fn reports_missing_target_enable_even_when_previous_disable_exists() {
+        const TARGET_ICCID: &str = "8900000000000000001";
+        const PREVIOUS_ICCID: &str = "8900000000000000002";
+        let notifications = vec![rsp_notification(26, "disable", PREVIOUS_ICCID)];
+        let scope = EsimRspNotificationScope::Enable {
+            target_iccid: crate::utils::normalize_iccid(TARGET_ICCID),
+            previous_iccids: HashSet::from([crate::utils::normalize_iccid(PREVIOUS_ICCID)]),
+        };
+
+        let selected = select_new_rsp_notifications(&HashSet::new(), notifications, &scope);
+
+        assert!(!selected.expected_target_found);
+        assert_eq!(selected.notifications.len(), 1);
+        assert_eq!(selected.notifications[0].sequence_number, 26);
+    }
+
+    #[test]
+    fn infers_a_single_download_iccid_and_deduplicates_sequences() {
+        const TARGET_ICCID: &str = "8900000000000000001";
+        let notifications = vec![
+            rsp_notification(31, "install", TARGET_ICCID),
+            rsp_notification(31, "install", TARGET_ICCID),
+            rsp_notification(32, "enable", TARGET_ICCID),
+        ];
+        let scope = EsimRspNotificationScope::Download { target_iccid: None };
+
+        let selected = select_new_rsp_notifications(&HashSet::new(), notifications, &scope);
+
+        assert!(selected.expected_target_found);
+        assert_eq!(
+            selected
+                .notifications
+                .iter()
+                .map(|notification| notification.sequence_number)
+                .collect::<Vec<_>>(),
+            vec![31]
+        );
+    }
+
+    #[test]
+    fn refuses_to_guess_between_multiple_download_iccids() {
+        let notifications = vec![
+            rsp_notification(41, "install", "8900000000000000001"),
+            rsp_notification(42, "install", "8900000000000000002"),
+        ];
+        let scope = EsimRspNotificationScope::Download { target_iccid: None };
+
+        let selected = select_new_rsp_notifications(&HashSet::new(), notifications, &scope);
+
+        assert!(!selected.expected_target_found);
+        assert!(selected.notifications.is_empty());
+    }
+
+    #[test]
+    fn builds_profile_enable_fallbacks_in_compatibility_order() {
+        const AID: &str = "A0000005591010FFFFFFFF8900000100";
+        let attempts = fallback_enable_attempts(
+            "TEST_ICCID",
+            Some(" 0xA000 0005 5910 10FF FFFF FF89 0000 0100 "),
+        );
+
+        assert_eq!(
+            attempts,
+            vec![
+                EsimProfileEnableAttempt {
+                    identifier: "TEST_ICCID".to_string(),
+                    identifier_kind: "ICCID",
+                    refresh: false,
+                },
+                EsimProfileEnableAttempt {
+                    identifier: AID.to_string(),
+                    identifier_kind: "AID",
+                    refresh: true,
+                },
+                EsimProfileEnableAttempt {
+                    identifier: AID.to_string(),
+                    identifier_kind: "AID",
+                    refresh: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn omits_aid_fallback_when_profile_aid_is_missing_or_invalid() {
+        for aid in [None, Some("  "), Some("not-a-valid-aid"), Some("A0000")] {
+            let attempts = fallback_enable_attempts("TEST_ICCID", aid);
+
+            assert_eq!(
+                attempts,
+                vec![EsimProfileEnableAttempt {
+                    identifier: "TEST_ICCID".to_string(),
+                    identifier_kind: "ICCID",
+                    refresh: false,
+                }]
+            );
+        }
+    }
+
     #[test]
     fn enriches_enabled_esim_profile_from_current_sim_identity() {
         let mut profiles = vec![
@@ -4170,13 +4862,67 @@ mod tests {
             operator_id: "234336".to_string(),
         };
 
-        enrich_profiles_with_current_identity(&mut profiles, &identity);
+        enrich_profiles_with_current_identity(&mut profiles, &identity, None);
 
         assert_eq!(profiles[1].state, "enabled");
         assert_eq!(profiles[1].imsi.as_deref(), Some("234336"));
         assert_eq!(profiles[1].mcc.as_deref(), Some("234"));
         assert_eq!(profiles[1].mnc.as_deref(), Some("336"));
         assert!(profiles[0].mcc.is_none());
+    }
+
+    #[test]
+    fn enriches_current_esim_profile_with_sim_detail_cache() {
+        let db = Database::new(std::path::PathBuf::from(":memory:")).unwrap();
+        let identity = SimIdentity {
+            iccid: "profile-b".to_string(),
+            imsi: "234336".to_string(),
+            operator_id: "234336".to_string(),
+        };
+        crate::modem_manager::cache_own_numbers_for_identity(
+            &db,
+            &identity,
+            &["+441234567890".to_string()],
+            "background",
+        );
+        crate::modem_manager::cache_smsc_for_identity(
+            &db,
+            &identity,
+            "+447785016005",
+            "background",
+        );
+        let mut profiles = vec![
+            EsimProfile {
+                iccid: "profile-a".to_string(),
+                state: "disabled".to_string(),
+                ..Default::default()
+            },
+            EsimProfile {
+                iccid: "profile-b".to_string(),
+                state: "enabled".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        enrich_profiles_with_current_identity(&mut profiles, &identity, Some(&db));
+
+        assert_eq!(profiles[1].msisdn.as_deref(), Some("+441234567890"));
+        assert_eq!(profiles[1].smsc.as_deref(), Some("+447785016005"));
+        assert!(profiles[0].msisdn.is_none());
+        assert!(profiles[0].smsc.is_none());
+    }
+
+    #[test]
+    fn enabled_profile_missing_sim_details_needs_enrichment() {
+        let profile = EsimProfile {
+            iccid: "profile-b".to_string(),
+            state: "enabled".to_string(),
+            smsc: Some("+447785016005".to_string()),
+            ..Default::default()
+        };
+
+        assert!(esim_profile_is_active(&profile));
+        assert!(esim_profile_sim_details_missing(&profile));
     }
 
     #[test]
@@ -4199,7 +4945,7 @@ mod tests {
             operator_id: String::new(),
         };
 
-        enrich_profiles_with_current_identity(&mut profiles, &identity);
+        enrich_profiles_with_current_identity(&mut profiles, &identity, None);
 
         assert_eq!(profiles[0].state, "disabled");
         assert_eq!(profiles[1].state, "enabled");
@@ -4230,7 +4976,10 @@ mod tests {
 
         sort_esim_profiles_for_display(&mut profiles);
 
-        let order: Vec<&str> = profiles.iter().map(|profile| profile.iccid.as_str()).collect();
+        let order: Vec<&str> = profiles
+            .iter()
+            .map(|profile| profile.iccid.as_str())
+            .collect();
         assert_eq!(order, vec!["200", "100", "300"]);
     }
 

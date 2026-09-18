@@ -14,7 +14,13 @@ import {
   TextField,
   Snackbar,
   Alert,
-  LinearProgress,
+  Button,
+  Dialog,
+  DialogTitle,
+  DialogContent,
+  DialogContentText,
+  DialogActions,
+  Paper,
 } from '@mui/material'
 import Grid from '@mui/material/Grid'
 import {
@@ -28,10 +34,13 @@ import {
   Language as LanguageIcon,
   Lock as LockIcon,
   Storage as StorageIcon,
+  Memory,
+  CheckCircle,
+  Tune,
 } from '@mui/icons-material'
 import { useSearchParams } from 'react-router-dom'
-import { api } from '../api/current'
-import type { SimInfo } from '../api/types'
+import { useSimAdminApi } from '../contexts/ApiContext'
+import type { SimInfo, WorkMode } from '../api/types'
 import ErrorSnackbar from '../components/ErrorSnackbar'
 import EsimManagerPage from './EsimManager'
 import { useWorkMode } from '../contexts/WorkModeContext'
@@ -135,6 +144,7 @@ function InfoField({ label, value, sensitive = false, showSensitive, extra }: {
       </Typography>
       <Box display="flex" alignItems="center" gap={0.5} mt={0.25} minHeight="20px">
         <Typography
+          data-sensitive={sensitive ? 'true' : undefined}
           variant="body2"
           component="div"
           sx={{
@@ -151,36 +161,17 @@ function InfoField({ label, value, sensitive = false, showSensitive, extra }: {
   )
 }
 
-function SmsCapacityProgress({ used, total }: { used?: number, total?: number }) {
-  if (used === undefined || total === undefined) return <Typography variant="body2" sx={{ fontSize: '0.825rem' }}>N/A</Typography>;
-  const percentage = Math.min((used / total) * 100, 100);
-  const isFull = used >= total;
-  return (
-    <Box display="flex" flexDirection="column" width="100%" gap={0.25}>
-      <Box display="flex" justifyContent="space-between" alignItems="center">
-        <Typography variant="body2" sx={{ fontWeight: 600, fontSize: '0.825rem' }}>
-          {used} / {total} 条
-        </Typography>
-        {isFull && (
-          <Chip label="已满" color="error" size="small" sx={{ height: 16, fontSize: '0.65rem' }} />
-        )}
-      </Box>
-      <LinearProgress
-        variant="determinate"
-        value={percentage}
-        color={isFull ? "error" : percentage > 80 ? "warning" : "primary"}
-        sx={{ height: 5, borderRadius: 3, mt: 0.5 }}
-      />
-    </Box>
-  );
-}
 
-function SimBasicInfo() {
-  const { mode } = useWorkMode()
+
+function SimBasicInfo({ readOnly = false }: { readOnly?: boolean }) {
+  const api = useSimAdminApi()
+  const { mode, esimSupported, refreshWorkMode } = useWorkMode()
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [showSensitive, setShowSensitive] = useState(false)
   const [simInfo, setSimInfo] = useState<SimInfo | null>(null)
+  const [pendingMode, setPendingMode] = useState<WorkMode | null>(null)
+  const [modeSwitching, setModeSwitching] = useState(false)
 
   const [editingPhone, setEditingPhone] = useState(false)
   const [editingSmsc, setEditingSmsc] = useState(false)
@@ -221,13 +212,13 @@ function SimBasicInfo() {
         setSimInfo(simRes.data)
         const data = simRes.data
         const missingSlowFields =
-          data.present && (!data.phone_numbers?.length || !data.sms_center || data.sms_total === undefined)
-        if (missingSlowFields && data.iccid && autoDetailsRefreshIccidRef.current !== data.iccid) {
+          data.present && (!data.phone_numbers?.length || !data.sms_center)
+        if (!readOnly && missingSlowFields && data.iccid && autoDetailsRefreshIccidRef.current !== data.iccid) {
           autoDetailsRefreshIccidRef.current = data.iccid
           setDetailsRefreshing(true)
           void api.refreshSimDetails()
             .then(scheduleDetailsRefetch)
-            .catch(() => {})
+            .catch(() => { })
             .finally(() => setDetailsRefreshing(false))
         }
       }
@@ -296,6 +287,25 @@ function SimBasicInfo() {
     }
   }
 
+  const confirmModeSwitch = async () => {
+    if (!pendingMode) return
+    setModeSwitching(true)
+    try {
+      const res = await api.setWorkMode(pendingMode)
+      if (res.status === 'ok') {
+        await refreshWorkMode()
+        showMsg(`工作模式已切换为${pendingMode === 'esim' ? '实体 eSIM 卡' : '国内实体 SIM 卡'}`, 'success')
+        setPendingMode(null)
+      } else {
+        showMsg(res.message || '切换工作模式失败', 'error')
+      }
+    } catch (err) {
+      showMsg(err instanceof Error ? err.message : String(err), 'error')
+    } finally {
+      setModeSwitching(false)
+    }
+  }
+
   useEffect(() => {
     void loadData()
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
@@ -328,7 +338,7 @@ function SimBasicInfo() {
                         <IconButton
                           size="small"
                           onClick={() => void handleRefreshDetails()}
-                          disabled={detailsRefreshing || !simInfo?.present}
+                          disabled={readOnly || detailsRefreshing || !simInfo?.present}
                         >
                           {detailsRefreshing ? <CircularProgress size={16} /> : <Refresh fontSize="small" />}
                         </IconButton>
@@ -398,7 +408,7 @@ function SimBasicInfo() {
                         showSensitive={showSensitive}
                         value={simInfo?.phone_numbers?.length ? simInfo.phone_numbers.join(', ') : 'N/A'}
                         extra={
-                          showSensitive && (isPhoneEmpty || simInfo?.phone_number_is_manual) && simInfo?.present && (
+                          !readOnly && showSensitive && (isPhoneEmpty || simInfo?.phone_number_is_manual) && simInfo?.present && (
                             <IconButton size="small" sx={{ p: 0.25 }} onClick={() => { setPhoneInput(simInfo?.phone_numbers?.[0] || ''); setEditingPhone(true); }}>
                               <Edit sx={{ fontSize: '0.9rem' }} />
                             </IconButton>
@@ -438,7 +448,7 @@ function SimBasicInfo() {
                         showSensitive={showSensitive}
                         value={simInfo?.sms_center || '未读取到'}
                         extra={
-                          showSensitive && (isSmscEmpty || simInfo?.sms_center_is_manual) && simInfo?.present && (
+                          !readOnly && showSensitive && (isSmscEmpty || simInfo?.sms_center_is_manual) && simInfo?.present && (
                             <IconButton size="small" sx={{ p: 0.25 }} onClick={() => { setSmscInput(simInfo?.sms_center || ''); setEditingSmsc(true); }}>
                               <Edit sx={{ fontSize: '0.9rem' }} />
                             </IconButton>
@@ -548,32 +558,22 @@ function SimBasicInfo() {
               </CardContent>
             </Card>
 
-            {/* Card 4: 短信存储与系统信息 */}
+            {/* Card 4: 对象路径 */}
             <Card sx={{ flexGrow: 1, display: 'flex', flexDirection: 'column' }}>
               <CardHeader
                 avatar={<StorageIcon color="primary" />}
-                title="短信存储与系统信息"
+                title="对象路径"
                 titleTypographyProps={{ variant: 'subtitle1', fontWeight: 600 }}
               />
               <CardContent sx={{ pt: 0, flexGrow: 1 }}>
                 <Grid container spacing={2}>
                   <Grid size={12}>
-                    <Box>
-                      <Typography variant="caption" color="text.secondary" sx={{ fontWeight: 500 }}>
-                        SIM 卡短信容量
-                      </Typography>
-                      <Box display="flex" alignItems="center" mt={0.5} width="100%">
-                        <SmsCapacityProgress used={simInfo?.sms_used} total={simInfo?.sms_total} />
-                      </Box>
-                    </Box>
-                  </Grid>
-                  <Grid size={6}>
                     <InfoField
                       label="SIM 路径"
                       value={simInfo?.sim_path || 'N/A'}
                     />
                   </Grid>
-                  <Grid size={6}>
+                  <Grid size={12}>
                     <InfoField
                       label="Modem 路径"
                       value={simInfo?.modem_path || 'N/A'}
@@ -585,6 +585,132 @@ function SimBasicInfo() {
           </Box>
         </Grid>
       </Grid>
+
+      {/* 工作模式卡片（底部轻量化呈现） */}
+      {!readOnly && esimSupported && (
+        <Card sx={{ mt: 3 }}>
+        <CardHeader
+          avatar={<Tune color="primary" />}
+          title="工作模式设置"
+          titleTypographyProps={{ variant: 'subtitle1', fontWeight: 600 }}
+          subheader="控制是否开放 eSIM 管理功能及 lpac 接口"
+          subheaderTypographyProps={{ variant: 'caption', color: 'text.secondary' }}
+          action={
+            <Chip
+              label={mode === 'esim' ? '实体 eSIM 卡' : '国内实体 SIM 卡'}
+              color="primary"
+              variant="outlined"
+              size="small"
+              sx={{ fontWeight: 600, borderColor: 'primary.light', color: 'primary.main' }}
+            />
+          }
+        />
+        <CardContent sx={{ pt: 0 }}>
+          <Grid container spacing={2}>
+            <Grid size={{ xs: 12, sm: 6 }}>
+              <Paper
+                variant="outlined"
+                onClick={() => {
+                  if (!modeSwitching && mode !== 'sim') setPendingMode('sim')
+                }}
+                sx={{
+                  p: 1.5,
+                  cursor: mode === 'sim' || modeSwitching ? 'default' : 'pointer',
+                  bgcolor: mode === 'sim' ? (theme) => (theme.palette.mode === 'light' ? 'rgba(25, 118, 210, 0.04)' : 'rgba(144, 202, 249, 0.08)') : 'background.paper',
+                  borderColor: mode === 'sim' ? 'primary.main' : 'divider',
+                  borderWidth: mode === 'sim' ? 1.5 : 1,
+                  borderRadius: 1.5,
+                  transition: 'all 0.15s ease',
+                  '&:hover': mode === 'sim' || modeSwitching ? {} : {
+                    borderColor: 'primary.light',
+                    bgcolor: 'action.hover',
+                  },
+                }}
+              >
+                <Box display="flex" alignItems="center" justifyContent="space-between" mb={0.5}>
+                  <Box display="flex" alignItems="center" gap={1}>
+                    <SimIcon color={mode === 'sim' ? 'primary' : 'action'} fontSize="small" />
+                    <Typography variant="body2" fontWeight={700}>
+                      国内实体 SIM 卡
+                    </Typography>
+                  </Box>
+                  {mode === 'sim' && <CheckCircle color="primary" fontSize="small" />}
+                </Box>
+                <Typography variant="caption" color="text.secondary" display="block" sx={{ lineHeight: 1.4 }}>
+                  适合使用国内运营商物理 SIM 卡，隐藏 eSIM 管理模块并阻止 lpac 接口。
+                </Typography>
+              </Paper>
+            </Grid>
+
+            <Grid size={{ xs: 12, sm: 6 }}>
+              <Paper
+                variant="outlined"
+                onClick={() => {
+                  if (!modeSwitching && mode !== 'esim') setPendingMode('esim')
+                }}
+                sx={{
+                  p: 1.5,
+                  cursor: mode === 'esim' || modeSwitching ? 'default' : 'pointer',
+                  bgcolor: mode === 'esim' ? (theme) => (theme.palette.mode === 'light' ? 'rgba(25, 118, 210, 0.04)' : 'rgba(144, 202, 249, 0.08)') : 'background.paper',
+                  borderColor: mode === 'esim' ? 'primary.main' : 'divider',
+                  borderWidth: mode === 'esim' ? 1.5 : 1,
+                  borderRadius: 1.5,
+                  transition: 'all 0.15s ease',
+                  '&:hover': mode === 'esim' || modeSwitching ? {} : {
+                    borderColor: 'primary.light',
+                    bgcolor: 'action.hover',
+                  },
+                }}
+              >
+                <Box display="flex" alignItems="center" justifyContent="space-between" mb={0.5}>
+                  <Box display="flex" alignItems="center" gap={1}>
+                    <Memory color={mode === 'esim' ? 'primary' : 'action'} fontSize="small" />
+                    <Typography variant="body2" fontWeight={700}>
+                      实体 eSIM 卡
+                    </Typography>
+                  </Box>
+                  {mode === 'esim' && <CheckCircle color="primary" fontSize="small" />}
+                </Box>
+                <Typography variant="caption" color="text.secondary" display="block" sx={{ lineHeight: 1.4 }}>
+                  适合插入了 eUICC 芯片的 eSIM 卡，开放 eSIM 管理模块与 Profile 调度。
+                </Typography>
+              </Paper>
+            </Grid>
+          </Grid>
+        </CardContent>
+        </Card>
+      )}
+
+      <Dialog open={!!pendingMode} onClose={() => !modeSwitching && setPendingMode(null)} maxWidth="xs" fullWidth>
+        <DialogTitle sx={{ fontSize: '1.05rem', fontWeight: 600 }}>确认切换工作模式</DialogTitle>
+        <DialogContent>
+          <DialogContentText variant="body2">
+            确定要切换为 <strong>{pendingMode === 'esim' ? '实体 eSIM 卡' : '国内实体 SIM 卡'}</strong> 吗？
+          </DialogContentText>
+          {pendingMode === 'sim' && (
+            <Alert severity="info" sx={{ mt: 1.5, fontSize: '0.8rem' }}>
+              切换后将隐藏 eSIM 管理 Tab 页面，并阻止 eSIM Profile 管理接口。
+            </Alert>
+          )}
+          {pendingMode === 'esim' && (
+            <Alert severity="info" sx={{ mt: 1.5, fontSize: '0.8rem' }}>
+              切换后将显示 eSIM 管理 Tab 页面，按需调用 lpac 管理配置文件。
+            </Alert>
+          )}
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setPendingMode(null)} disabled={modeSwitching}>取消</Button>
+          <Button
+            variant="contained"
+            color="primary"
+            onClick={() => void confirmModeSwitch()}
+            disabled={modeSwitching}
+            startIcon={modeSwitching ? <CircularProgress size={16} color="inherit" /> : undefined}
+          >
+            确认切换
+          </Button>
+        </DialogActions>
+      </Dialog>
 
       <Snackbar
         open={snackbar.open}
@@ -600,12 +726,17 @@ function SimBasicInfo() {
   )
 }
 
-export default function SimCardPage() {
-  const { mode, loading } = useWorkMode()
+export interface SimCardPageProps {
+  embeddedBasicOnly?: boolean
+  readOnly?: boolean
+}
+
+export default function SimCardPage({ embeddedBasicOnly = false, readOnly = false }: SimCardPageProps) {
+  const { mode, esimSupported, loading } = useWorkMode()
   const [searchParams, setSearchParams] = useSearchParams()
   let activeTab = searchParams.get('tab') || 'basic'
 
-  if (mode !== 'esim' && activeTab === 'esim') {
+  if ((!esimSupported || mode !== 'esim') && activeTab === 'esim') {
     activeTab = 'basic'
   }
 
@@ -627,6 +758,8 @@ export default function SimCardPage() {
     )
   }
 
+  if (embeddedBasicOnly) return <SimBasicInfo readOnly={readOnly} />
+
   return (
     <Box>
       <Box mb={2}>
@@ -638,13 +771,13 @@ export default function SimCardPage() {
       <Box sx={{ borderBottom: 1, borderColor: 'divider', mb: 2 }}>
         <Tabs value={activeTab} onChange={handleTabChange} variant="scrollable" scrollButtons="auto">
           <Tab label="基本信息" value="basic" />
-          {mode === 'esim' && <Tab label="eSIM 管理" value="esim" sx={{ textTransform: 'none' }} />}
+          {esimSupported && mode === 'esim' && <Tab label="eSIM 管理" value="esim" sx={{ textTransform: 'none' }} />}
         </Tabs>
       </Box>
 
       <Box sx={{ mt: 2 }}>
-        {activeTab === 'basic' && <SimBasicInfo />}
-        {activeTab === 'esim' && mode === 'esim' && <EsimManagerPage />}
+        {activeTab === 'basic' && <SimBasicInfo readOnly={readOnly} />}
+        {activeTab === 'esim' && esimSupported && mode === 'esim' && <EsimManagerPage />}
       </Box>
     </Box>
   )

@@ -4,15 +4,10 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: '版本号（例如：1.0.0）'
+        description: '版本号（例如 1.2.0，填 auto 则自动读取 VERSION 文件）'
         required: false
         type: string
         default: 'auto'
-      use_upx:
-        description: 'build with upx'
-        required: false
-        type: boolean
-        default: true
       release_type:
         description: '发布类型（Release type）'
         required: true
@@ -21,6 +16,46 @@ on:
         options:
           - '最新正式版（latest release）'
           - '预发布版（pre-release）'
+      build_standard:
+        description: '构建 标准版 (Standard)'
+        required: true
+        type: boolean
+        default: true
+      build_volte:
+        description: '构建 VoLTE 版'
+        required: true
+        type: boolean
+        default: true
+      build_vowifi:
+        description: '构建 VoWiFi 版'
+        required: true
+        type: boolean
+        default: true
+      build_full:
+        description: '构建 完整版 (Full)'
+        required: true
+        type: boolean
+        default: true
+      arch_aarch64:
+        description: '构建 aarch64 (ARM64)'
+        required: true
+        type: boolean
+        default: true
+      arch_armv7:
+        description: '构建 armv7 (ARM32)'
+        required: true
+        type: boolean
+        default: true
+      arch_x86_64:
+        description: '构建 x86_64 (AMD64)'
+        required: true
+        type: boolean
+        default: true
+      use_upx:
+        description: '使用 UPX 压缩二进制 (自动跳过 armv7)'
+        required: false
+        type: boolean
+        default: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -30,335 +65,572 @@ permissions:
   contents: write
 
 jobs:
-  build-ota:
-    name: Build OTA Package
-    runs-on: ubuntu-24.04-arm
-    
+  prepare:
+    name: Resolve version & build matrix
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      matrix: ${{ steps.resolve.outputs.matrix }}
+      has_jobs: ${{ steps.resolve.outputs.has_jobs }}
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0  # 获取完整历史，用于 git commit hash
-      
-      - name: Read VERSION
-        id: version
+      - uses: actions/checkout@v4
+      - name: Resolve version and dynamic matrix
+        id: resolve
         env:
           INPUT_VERSION: ${{ inputs.version }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          BUILD_STANDARD: ${{ inputs.build_standard }}
+          BUILD_VOLTE: ${{ inputs.build_volte }}
+          BUILD_VOWIFI: ${{ inputs.build_vowifi }}
+          BUILD_FULL: ${{ inputs.build_full }}
+          ARCH_AARCH64: ${{ inputs.arch_aarch64 }}
+          ARCH_ARMV7: ${{ inputs.arch_armv7 }}
+          ARCH_X86_64: ${{ inputs.arch_x86_64 }}
         run: |
-          CURRENT_VERSION=$(cat VERSION | tr -d '[:space:]')
-          VERSION=$(echo "$INPUT_VERSION" | tr -d '[:space:]')
+          python3 - <<'EOF'
+          import os, sys, json, re
 
-          if [ -z "$VERSION" ] || [ "$VERSION" = "auto" ]; then
-            VERSION="$CURRENT_VERSION"
-            SOURCE="VERSION file"
-          else
-            SOURCE="workflow input"
-          fi
+          # 1. 解析版本号
+          input_ver = (os.environ.get('INPUT_VERSION') or '').strip()
+          version = ''
+          if not input_ver or input_ver == 'auto':
+              if os.path.exists('VERSION'):
+                  with open('VERSION', 'r', encoding='utf-8') as f:
+                      version = f.read().strip()
+          else:
+              version = input_ver
 
-          if [ -z "$VERSION" ]; then
-            echo "❌ 错误: 版本号不能为空"
-            exit 1
-          fi
+          if not version or not re.match(r'^[0-9]+(\.[0-9]+){1,3}([-.][0-9A-Za-z]+)*$', version):
+              print(f"❌ 错误: 无效的版本号 '{version}'", file=sys.stderr)
+              sys.exit(1)
 
-          if ! echo "$VERSION" | grep -Eq '^[0-9]+(\.[0-9]+){1,3}([-.][0-9A-Za-z]+)*$'; then
-            echo "❌ 错误: 版本号格式不合法: $VERSION"
-            echo "示例: 1.0.0, 1.0.0-beta.1"
-            exit 1
-          fi
+          repo = os.environ.get('GITHUB_REPOSITORY', '3899/SimAdmin')
+          ref_name = os.environ.get('GITHUB_REF_NAME', 'dev')
 
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "current_version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
-          echo "version_source=$SOURCE" >> $GITHUB_OUTPUT
-          echo "📦 当前 VERSION 文件版本: $CURRENT_VERSION"
-          echo "📦 本次打包版本号: $VERSION ($SOURCE)"
-      
-      # ==================== 安装 Rust 工具链 ====================
+          build_std = os.environ.get('BUILD_STANDARD', 'true').lower() == 'true'
+          build_volte = os.environ.get('BUILD_VOLTE', 'true').lower() == 'true'
+          build_vowifi = os.environ.get('BUILD_VOWIFI', 'true').lower() == 'true'
+          build_full = os.environ.get('BUILD_FULL', 'true').lower() == 'true'
+
+          arch_a64 = os.environ.get('ARCH_AARCH64', 'true').lower() == 'true'
+          arch_armv7 = os.environ.get('ARCH_ARMV7', 'true').lower() == 'true'
+          arch_x64 = os.environ.get('ARCH_X86_64', 'true').lower() == 'true'
+
+          # 2. 组装支持的架构
+          arch_configs = []
+          if arch_a64:
+              arch_configs.append({
+                  'target': 'aarch64-unknown-linux-musl',
+                  'runner': 'ubuntu-24.04-arm',
+                  'cross': False,
+                  'arch_suffix': 'aarch64'
+              })
+          if arch_armv7:
+              arch_configs.append({
+                  'target': 'armv7-unknown-linux-musleabihf',
+                  'runner': 'ubuntu-latest',
+                  'cross': True,
+                  'arch_suffix': 'armv7'
+              })
+          if arch_x64:
+              arch_configs.append({
+                  'target': 'x86_64-unknown-linux-musl',
+                  'runner': 'ubuntu-latest',
+                  'cross': False,
+                  'arch_suffix': 'x86_64'
+              })
+
+          # 3. 组装支持的版本分支
+          editions = []
+          if repo == '3899/SimAdmin':
+              if build_std:
+                  editions.append({
+                      'edition': 'standard',
+                      'edition_title': '标准版',
+                      'branch': ref_name
+                  })
+              if build_volte or build_vowifi or build_full:
+                  print("ℹ️ 公开仓库 3899/SimAdmin 中无私有增强分支源码，仅构建标准版。私有增强版请在私有仓库 SimAdmin-Code 触发。")
+          elif repo == '3899/SimAdmin-Code':
+              if build_volte:
+                  editions.append({'edition': 'volte', 'edition_title': 'VoLTE 版', 'branch': 'volte'})
+              if build_vowifi:
+                  editions.append({'edition': 'vowifi', 'edition_title': 'VoWiFi 版', 'branch': 'vowifi'})
+              if build_full:
+                  editions.append({'edition': 'full', 'edition_title': '完整版', 'branch': 'full'})
+          else:
+              editions.append({
+                  'edition': 'standard',
+                  'edition_title': '标准版',
+                  'branch': ref_name
+              })
+
+          matrix_include = []
+          for ed in editions:
+              for ar in arch_configs:
+                  item = dict(ed)
+                  item.update(ar)
+                  matrix_include.append(item)
+
+          has_jobs = 'true' if matrix_include else 'false'
+          matrix_json = json.dumps({'include': matrix_include})
+
+          print(f"📦 解析版本号: {version}")
+          print(f"🚀 生成构建任务数: {len(matrix_include)}")
+          for m in matrix_include:
+              print(f"  - [{m['edition']}] {m['target']} (branch: {m['branch']}, runner: {m['runner']})")
+
+          gh_out = os.environ.get('GITHUB_OUTPUT')
+          if gh_out:
+              with open(gh_out, 'a', encoding='utf-8') as f:
+                  f.write(f"version={version}\n")
+                  f.write(f"has_jobs={has_jobs}\n")
+                  f.write(f"matrix={matrix_json}\n")
+          EOF
+
+  build:
+    name: Build ${{ matrix.edition }} (${{ matrix.arch_suffix }})
+    needs: prepare
+    if: needs.prepare.outputs.has_jobs == 'true'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout repository (${{ matrix.branch }})
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.branch }}
+          fetch-depth: 0
+
+      - name: Sync version numbers
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          printf '%s\n' "$VERSION" > VERSION
+          sed -i "s/^version = \"[^\"]*\"/version = \"$VERSION\"/" backend/Cargo.toml
+          sed -i "s/\"version\": \"[^\"]*\"/\"version\": \"$VERSION\"/" frontend/package.json
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-unknown-linux-musl
-      
-      # ==================== 安装交叉编译工具链 ====================
-      - name: Install cross-compilation toolchain
+          targets: ${{ matrix.target }}
+
+      - name: Install native build tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools
-          musl-gcc --version
-      
-      # ==================== 安装 UPX (可选) ====================
-      - name: Install UPX
-        if: inputs.use_upx == true
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            echo "ARMv7 backend will be built with cross-rs Docker toolchain"
+          else
+            sudo apt-get install -y musl-tools
+          fi
+          if [ "${{ inputs.use_upx }}" = "true" ] && [ "${{ matrix.target }}" != "armv7-unknown-linux-musleabihf" ]; then
+            sudo apt-get install -y upx-ucl
+          fi
+          if [ "${{ matrix.cross }}" != "true" ]; then
+            musl-gcc --version
+          fi
+
+      - name: Verify ARMv7 helper scripts
+        if: matrix.target == 'armv7-unknown-linux-musleabihf'
+        run: bash scripts/tests/test-armv7.sh
+
+      - name: Install cross
+        if: matrix.cross == true
+        run: cargo install cross --locked
+
+      - name: Clean previous build outputs
         run: |
-          sudo apt-get install -y upx-ucl
-          upx --version
-      
-      # ==================== 缓存 Rust 依赖 ====================
+          rm -f "target/${{ matrix.target }}/release/simadmin" "target/${{ matrix.target }}/release/simadmin.exe" "target/release/simadmin" "target/release/simadmin.exe"
+          rm -rf frontend/dist
+
       - name: Cache Rust dependencies
         uses: actions/cache@v4
         with:
           path: |
-            ~/.cargo/bin/
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-            backend/target/
-          key: ${{ runner.os }}-musl-cargo-${{ hashFiles('**/Cargo.lock') }}
+            target/
+          key: ${{ runner.os }}-${{ runner.arch }}-${{ matrix.edition }}-${{ matrix.target }}-cargo-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-musl-cargo-
-      
-      # ==================== 同步版本号 ====================
-      - name: Sync version numbers
-        run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          echo "同步版本号: $VERSION"
+            ${{ runner.os }}-${{ runner.arch }}-${{ matrix.edition }}-${{ matrix.target }}-cargo-
 
-          # 更新根目录 VERSION，确保 build.rs 注入的 APP_VERSION 与本次 OTA 包一致
-          printf "%s\n" "$VERSION" > VERSION
-          
-          # 更新 backend/Cargo.toml
-          sed -i "s/^version = \"[^\"]*\"/version = \"$VERSION\"/" backend/Cargo.toml
-          
-          # 更新 frontend/package.json
-          sed -i "s/\"version\": \"[^\"]*\"/\"version\": \"$VERSION\"/" frontend/package.json
-          
-          echo "✅ 版本号同步完成"
-      
-      # ==================== 构建后端 ====================
-      - name: Build backend (aarch64-unknown-linux-musl)
-        working-directory: backend
+
+      - name: Build backend
+        env:
+          TARGET: ${{ matrix.target }}
+          SQLITE3_STATIC: '1'
+          LIBSQLITE3_SYS_USE_PKG_CONFIG: '0'
         run: |
-          echo "🦀 构建后端 (aarch64-unknown-linux-musl)..."
-          
-          # 设置交叉编译环境变量
-          export CC_AARCH64_UNKNOWN_LINUX_MUSL=musl-gcc
-          export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
-          export SQLITE3_STATIC=1
-          export LIBSQLITE3_SYS_USE_PKG_CONFIG=0
-          
-          # 构建
-          cargo build --release --target aarch64-unknown-linux-musl
-          
-          BINARY_PATH="target/aarch64-unknown-linux-musl/release/simadmin"
-          
-          echo "✅ 后端构建完成！"
-          ls -lh "$BINARY_PATH"
-          file "$BINARY_PATH"
-      
-      # ==================== UPX 压缩 (可选) ====================
-      - name: Compress binary with UPX
-        if: inputs.use_upx == true
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cross build --locked --release --target "$TARGET" -p simadmin
+          else
+            case "$TARGET" in
+              aarch64-unknown-linux-musl)
+                export CC_aarch64_unknown_linux_musl=musl-gcc
+                export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
+                ;;
+              x86_64-unknown-linux-musl)
+                export CC_x86_64_unknown_linux_musl=musl-gcc
+                export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
+                ;;
+            esac
+            cargo build --locked --release --target "$TARGET" -p simadmin
+          fi
+          file "target/$TARGET/release/simadmin"
+          if [ "$TARGET" = "armv7-unknown-linux-musleabihf" ]; then
+            readelf -h "target/$TARGET/release/simadmin" | grep -E 'Class:.*ELF32|Machine:.*ARM'
+          fi
+
+      - name: ARMv7 QEMU startup smoke test
+        if: matrix.target == 'armv7-unknown-linux-musleabihf'
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
-          BINARY_PATH="backend/target/aarch64-unknown-linux-musl/release/simadmin"
-          
-          echo "🗜️  UPX 压缩中..."
-          BEFORE_SIZE=$(stat -c%s "$BINARY_PATH")
-          
-          upx --best --lzma "$BINARY_PATH"
-          
-          AFTER_SIZE=$(stat -c%s "$BINARY_PATH")
-          RATIO=$(echo "scale=1; 100 - ($AFTER_SIZE * 100 / $BEFORE_SIZE)" | bc)
-          
-          echo "✅ 压缩完成！节省: ${RATIO}%"
-          ls -lh "$BINARY_PATH"
-      
-      # ==================== 设置 Node.js 环境 ====================
+          sudo apt-get update
+          sudo apt-get install -y qemu-user
+          qemu-arm "target/$TARGET/release/simadmin" --version
+
+      - name: Compress backend with UPX
+        if: inputs.use_upx == true && matrix.target != 'armv7-unknown-linux-musleabihf'
+        env:
+          TARGET: ${{ matrix.target }}
+        run: upx --best --lzma "target/$TARGET/release/simadmin"
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '24'
-      
+          node-version: 22
+
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
         with:
           version: 9
-      
-      - name: Get pnpm store directory
-        shell: bash
-        run: |
-          echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_ENV
-      
-      - name: Cache pnpm store
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.STORE_PATH }}
-          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
-          restore-keys: |
-            ${{ runner.os }}-pnpm-store-
-      
-      # ==================== 构建前端 ====================
+
       - name: Build frontend
         working-directory: frontend
         run: |
-          echo "🎨 构建前端..."
           pnpm install --frozen-lockfile
-          pnpm run build
-          
-          echo "✅ 前端构建完成！"
-          ls -lh dist/
-      
-      # ==================== 打包 OTA ====================
-      - name: Package OTA
-        run: |
-          echo "=========================================="
-          echo "  生成 OTA 更新包"
-          echo "=========================================="
-          echo ""
-          
-          VERSION="${{ steps.version.outputs.version }}"
-          COMMIT=$(git rev-parse --short HEAD)
-          BUILD_TIME=$(TZ=Asia/Shanghai date +"%Y-%m-%dT%H:%M:%S+08:00")
-          ARCH="aarch64-unknown-linux-musl"
-          
-          BINARY_PATH="backend/target/aarch64-unknown-linux-musl/release/simadmin"
-          FRONTEND_DIR="frontend/dist"
-          
-          # 检查构建产物
-          if [ ! -f "$BINARY_PATH" ]; then
-            echo "❌ 错误: 后端二进制不存在"
-            exit 1
-          fi
-          
-          if [ ! -d "$FRONTEND_DIR" ]; then
-            echo "❌ 错误: 前端构建产物不存在"
-            exit 1
-          fi
-          
-          # 创建临时目录
-          OTA_TMP=$(mktemp -d)
-          
-          echo "📦 版本: $VERSION"
-          echo "📝 Commit: $COMMIT"
-          echo "🕐 构建时间: $BUILD_TIME"
-          echo "📍 架构: $ARCH"
-          echo ""
-          
-          # 复制后端二进制
-          echo "📋 复制后端二进制..."
-          cp "$BINARY_PATH" "$OTA_TMP/simadmin"
-          chmod 755 "$OTA_TMP/simadmin"
-          
-          # 计算二进制 MD5 (Linux)
-          BINARY_MD5=$(md5sum "$OTA_TMP/simadmin" | cut -d' ' -f1)
-          echo "   MD5: $BINARY_MD5"
-          
-          # 复制前端文件
-          echo "📋 复制前端文件..."
-          mkdir -p "$OTA_TMP/www"
-          cp -r "$FRONTEND_DIR"/* "$OTA_TMP/www/"
+          pnpm run lint
+          pnpm exec vite build
 
-          # 计算前端 MD5 (Linux)
-          echo "📋 计算前端 MD5..."
-          FRONTEND_MD5=$(find "$OTA_TMP/www" -type f -exec md5sum {} \; | cut -d' ' -f1 | sort | md5sum | cut -d' ' -f1)
-          echo "   MD5: $FRONTEND_MD5"
-          
-          # 生成 meta.json
-          echo "📋 生成 meta.json..."
-          cat > "$OTA_TMP/meta.json" << EOF
-          {
-              "version": "$VERSION",
-              "commit": "$COMMIT",
-              "build_time": "$BUILD_TIME",
-              "binary_md5": "$BINARY_MD5",
-              "frontend_md5": "$FRONTEND_MD5",
-              "arch": "$ARCH"
-          }
-          EOF
-          
-          cat "$OTA_TMP/meta.json"
-          echo ""
-          
-          # 创建输出目录
-          mkdir -p release
-          
-          # 打包
-          OTA_FILE="release/simadmin.tar.gz"
-          echo "📦 打包 OTA 更新包..."
-          cd "$OTA_TMP"
-          tar -czf "$GITHUB_WORKSPACE/$OTA_FILE" meta.json simadmin www
-          cd "$GITHUB_WORKSPACE"
-          
-          # 显示结果
-          echo ""
-          echo "=========================================="
-          echo "✅ OTA 更新包打包完成！"
-          echo "=========================================="
-          echo ""
-          echo "📍 输出文件: $OTA_FILE"
-          ls -lh "$OTA_FILE"
-          echo ""
-          echo "📋 包内容:"
-          tar -tzf "$OTA_FILE" | head -20
-          echo ""
-          
-          # 计算包的 MD5 和 SHA-256
-          OTA_MD5=$(md5sum "$OTA_FILE" | cut -d' ' -f1)
-          OTA_SHA256=$(sha256sum "$OTA_FILE" | cut -d' ' -f1)
-          echo "📝 OTA 包 MD5: $OTA_MD5"
-          echo "📝 OTA 包 SHA-256: $OTA_SHA256"
-          echo ""
-          
-          # 保存到输出
-          echo "ota_file=$OTA_FILE" >> $GITHUB_OUTPUT
-          echo "ota_md5=$OTA_MD5" >> $GITHUB_OUTPUT
-          echo "ota_sha256=$OTA_SHA256" >> $GITHUB_OUTPUT
-          echo "build_time=$BUILD_TIME" >> $GITHUB_OUTPUT
-        id: package
-      
-      # ==================== 发布 OTA 包为 Release Asset ====================
-      - name: Publish OTA package
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: v${{ steps.version.outputs.version }}
-          name: SimAdmin_v${{ steps.version.outputs.version }}
-          files: |
-            release/simadmin.tar.gz
-          overwrite_files: true
-          generate_release_notes: true
-          body: |
-            ## OTA 更新包
-            
-            ### 版本信息
-            
-            - **版本**: ${{ steps.version.outputs.version }}
-            - **Commit**: ${{ github.sha }}
-            - **构建时间**: ${{ steps.package.outputs.build_time }}
-            - **发布类型**: ${{ inputs.release_type }}
-            - **文件名**: `simadmin.tar.gz`
-            - **MD5**: `${{ steps.package.outputs.ota_md5 }}`
-            - **SHA-256**: `${{ steps.package.outputs.ota_sha256 }}`
-            
-            ### 安装说明
-            
-            ```bash
-            # 上传 OTA 包到设备
-            curl -X POST http://IP:3000/api/ota/upload \
-              -F "file=@simadmin.tar.gz"
-            
-            # 开始 OTA 更新
-            curl -X POST http://IP:3000/api/ota/apply
-            ```
-          draft: false
-          prerelease: ${{ inputs.release_type == '预发布版（pre-release）' }}
-          make_latest: ${{ inputs.release_type == '最新正式版（latest release）' }}
+      - name: Package OTA
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      
-      # ==================== 构建摘要 ====================
-      - name: Build Summary
+          TARGET: ${{ matrix.target }}
+          EDITION: ${{ matrix.edition }}
+          ARCH_SUFFIX: ${{ matrix.arch_suffix }}
+          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
-          echo "## 🎉 OTA 包构建完成" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| 项目 | 值 |" >> $GITHUB_STEP_SUMMARY
-          echo "|------|-----|" >> $GITHUB_STEP_SUMMARY
-          echo "| VERSION 文件版本 | ${{ steps.version.outputs.current_version }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| 版本 | ${{ steps.version.outputs.version }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| 版本来源 | ${{ steps.version.outputs.version_source }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| 发布类型 | ${{ inputs.release_type }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Commit | ${{ github.sha }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| 架构 | aarch64-unknown-linux-musl |" >> $GITHUB_STEP_SUMMARY
-          echo "| UPX 压缩 | ${{ inputs.use_upx }} |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### 📦 产物" >> $GITHUB_STEP_SUMMARY
-          echo "- \`${{ steps.package.outputs.ota_file }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- MD5: \`${{ steps.package.outputs.ota_md5 }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- SHA-256: \`${{ steps.package.outputs.ota_sha256 }}\`" >> $GITHUB_STEP_SUMMARY
+          if [ "$EDITION" = "standard" ]; then
+            ./scripts/build/pack-ota.sh --target="$TARGET"
+            DEST="release/simadmin-${ARCH_SUFFIX}-v${VERSION}.tar.gz"
+          else
+            ./scripts/build/pack-ota.sh --target="$TARGET" --"$EDITION"
+            DEST="release/simadmin-${EDITION}-${ARCH_SUFFIX}-v${VERSION}.tar.gz"
+          fi
+
+          SOURCE="release/simadmin_${VERSION}_${TARGET}.tar.gz"
+          if [ -f "$SOURCE" ]; then
+            mv "$SOURCE" "$DEST"
+          fi
+
+          python3 - "$DEST" "$TARGET" "$EDITION" <<'PY'
+          import json, sys, tarfile
+          archive, target, edition = sys.argv[1:]
+          with tarfile.open(archive, 'r:gz') as package:
+              meta = json.load(package.extractfile('meta.json'))
+          if meta.get('arch') != target:
+              raise SystemExit(f"meta.json.arch mismatch: expected {target}, got {meta.get('arch')!r}")
+          if edition != 'standard':
+              expected_edition = 'full' if edition == 'full' else ('vowifi' if edition == 'vowifi' else 'volte')
+              if meta.get('edition') != expected_edition:
+                  raise SystemExit(f"meta.json.edition mismatch: expected {expected_edition}, got {meta.get('edition')!r}")
+          PY
+
+          sha256sum release/*.tar.gz
+
+      - name: Upload OTA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ota-${{ matrix.edition }}-${{ matrix.arch_suffix }}
+          path: release/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Publish and mount release
+    needs: [prepare, build]
+    if: needs.prepare.outputs.has_jobs == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download all OTA artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ota-*
+          path: release
+          merge-multiple: true
+
+      - name: Publish OTA packages and sync release notes
+        env:
+          GH_TOKEN: ${{ secrets.SIMADMIN_PUSH || secrets.SIMADMIN_RELEASE_TOKEN || github.token }}
+          TARGET_REPO: '3899/SimAdmin'
+          VERSION: ${{ needs.prepare.outputs.version }}
+          TAG_NAME: v${{ needs.prepare.outputs.version }}
+          RELEASE_TYPE: ${{ inputs.release_type }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          cd release
+          sha256sum -- ./*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+          cd ..
+
+          echo "🚀 检查公开仓库 $TARGET_REPO 中是否存在 $TAG_NAME 的 Release..."
+          if ! gh release view "$TAG_NAME" --repo "$TARGET_REPO" >/dev/null 2>&1; then
+            echo "⚠️ 未找到 $TAG_NAME Release，正在自动创建公开 Release 基础页面..."
+            gh release create "$TAG_NAME" --repo "$TARGET_REPO" --title "SimAdmin $TAG_NAME" --notes "SimAdmin $TAG_NAME 正式发布。"
+          fi
+
+          echo "📦 正在上传资产包至公开仓库 $TARGET_REPO 的 Release ($TAG_NAME)..."
+          gh release upload "$TAG_NAME" release/*.tar.gz --clobber --repo "$TARGET_REPO"
+          echo "✅ 资产包上传成功！"
+
+          echo "📝 正在检查并更新 Release 发布说明正文..."
+          BUILD_TIME=$(TZ='Asia/Shanghai' date +'%Y/%m/%d %H:%M:%S')
+          export BUILD_TIME
+
+          python3 - <<'EOF'
+          import os, sys, re, subprocess
+
+          tag = os.environ.get('TAG_NAME', '')
+          repo = os.environ.get('TARGET_REPO', '3899/SimAdmin')
+          version = os.environ.get('VERSION', tag.lstrip('v'))
+          commit_sha = os.environ.get('COMMIT_SHA', '')
+          release_type = os.environ.get('RELEASE_TYPE', '最新正式版（latest release）')
+          build_time = os.environ.get('BUILD_TIME', '')
+
+          # 1. 获取当前上传的所有包名
+          new_packages = [f for f in os.listdir('release') if f.endswith('.tar.gz')]
+          if not new_packages:
+              print("ℹ️ release 目录下未检测到 tar.gz 包，跳过更新说明。")
+              sys.exit(0)
+
+          # 2. 读取公开仓库 Release 当前正文
+          res = subprocess.run(
+              ['gh', 'release', 'view', tag, '--repo', repo, '--json', 'body', '-q', '.body'],
+              capture_output=True, text=True
+          )
+          if res.returncode != 0:
+              print("❌ 获取 Release 说明失败:", res.stderr)
+              sys.exit(1)
+
+          body = res.stdout
+
+          # 3. 确定 prev_tag
+          prev_tag = ''
+          try:
+              tags = subprocess.check_output(['git', 'tag', '--sort=-v:refname'], text=True).strip().splitlines()
+              tags = [t for t in tags if t.startswith('v') and t != tag]
+              if tags:
+                  prev_tag = tags[0]
+          except Exception:
+              pass
+          if not prev_tag:
+              prev_tag = 'v1.0.0'
+
+          # 4. 判断是否为初始占位符页面
+          is_placeholder = (
+              not body
+              or body.strip() == f"SimAdmin {tag} 正式发布。"
+              or "### 版本信息" not in body
+          )
+
+          if is_placeholder:
+              body = (
+                  f"### 版本信息\n\n"
+                  f"- **版本**: {version}\n"
+                  f"- **Commit**: {commit_sha}\n"
+                  f"- **构建时间**: {build_time}\n"
+                  f"- **发布类型**: {release_type}\n"
+                  f"- **资产包**: \n"
+                  f"\t- **aarch64 (ARM64)**: \n"
+                  f"\t- **armv7 (ARM32)**: \n"
+                  f"\t- **x86_64 (AMD64)**: \n\n"
+                  f"### 更新说明\n\n"
+                  f"**Full Changelog**: https://github.com/{repo}/compare/{prev_tag}...{tag}\n"
+              )
+
+          # 5. 更新资产包行 (横向平铺追加)
+          arch_patterns = {
+              'aarch64': r'(?m)^([ \t]*-[ \t]*\*\*aarch64[^\r\n]*?\*\*:[ \t]*)([^\r\n]*)$',
+              'armv7': r'(?m)^([ \t]*-[ \t]*\*\*armv7[^\r\n]*?\*\*:[ \t]*)([^\r\n]*)$',
+              'x86_64': r'(?m)^([ \t]*-[ \t]*\*\*x86_64[^\r\n]*?\*\*:[ \t]*)([^\r\n]*)$',
+          }
+
+          for pkg in sorted(new_packages):
+              arch = None
+              if 'aarch64' in pkg:
+                  arch = 'aarch64'
+              elif 'armv7' in pkg:
+                  arch = 'armv7'
+              elif 'x86_64' in pkg or 'amd64' in pkg:
+                  arch = 'x86_64'
+              if not arch:
+                  continue
+
+              pat = arch_patterns[arch]
+              m = re.search(pat, body)
+              if m:
+                  prefix = m.group(1)
+                  cur_assets = m.group(2).strip()
+                  pkg_code = f"`{pkg}`"
+                  if pkg_code not in cur_assets:
+                      new_assets = f"{cur_assets} {pkg_code}".strip()
+                      body = body[:m.start()] + f"{prefix}{new_assets}" + body[m.end():]
+
+          # 6. 从各分支提取更新说明并插入
+          def get_changelog_for_branch(branch):
+              for ref in [branch, f'origin/{branch}', f'refs/heads/{branch}', f'refs/remotes/origin/{branch}']:
+                  try:
+                      r = subprocess.run(['git', 'show', f'{ref}:docs/changelog.md'], capture_output=True, text=True)
+                      if r.returncode == 0 and r.stdout:
+                          return r.stdout
+                  except Exception:
+                      pass
+              if os.path.exists('docs/changelog.md'):
+                  with open('docs/changelog.md', 'r', encoding='utf-8') as f:
+                      return f.read()
+              return ''
+
+          def extract_edition_section(content, ver, title):
+              vm = re.search(rf'(?m)^#{{2,3}}\s*📌\s*v{re.escape(ver)}\s*$', content)
+              if not vm:
+                  return ''
+              start = vm.end()
+              next_v = re.search(r'(?m)^#{2,3}\s*📌\s*v\d+', content[start:])
+              v_block = content[start:start + next_v.start()].strip() if next_v else content[start:].strip()
+              
+              em = re.search(rf'(?m)^###\s*{re.escape(title)}\s*$', v_block)
+              if em:
+                  e_start = em.start()
+                  next_break = re.search(r'(?m)^(\s*---\s*$|###\s+)', v_block[em.end():])
+                  if next_break:
+                      return v_block[e_start:em.end() + next_break.start()].strip()
+                  else:
+                      return v_block[e_start:].strip()
+              elif title == '标准版' and '### ' not in v_block:
+                  return f"### 标准版\n\n{v_block}"
+              return f"### {title}\n\n- 详见 Commit 提交记录。"
+
+          edition_branch_map = {
+              '标准版': 'dev',
+              'VoLTE 版': 'volte',
+              'VoWiFi 版': 'vowifi',
+              '完整版': 'full'
+          }
+
+          ordered_editions = ['标准版', 'VoLTE 版', 'VoWiFi 版', '完整版']
+
+          # 检查本次构建了哪些版本
+          detected_editions = set()
+          for p in new_packages:
+              if 'volte' in p:
+                  detected_editions.add('VoLTE 版')
+              elif 'vowifi' in p:
+                  detected_editions.add('VoWiFi 版')
+              elif 'full' in p:
+                  detected_editions.add('完整版')
+              else:
+                  detected_editions.add('标准版')
+
+          for ed_title in ordered_editions:
+              if ed_title not in detected_editions:
+                  continue
+              
+              target_br = edition_branch_map.get(ed_title, 'dev')
+              ch_content = get_changelog_for_branch(target_br)
+              sec_text = extract_edition_section(ch_content, version, ed_title)
+              if not sec_text:
+                  continue
+
+              if not re.match(rf'^###\s*{re.escape(ed_title)}', sec_text):
+                  sec_text = f"### {ed_title}\n\n{sec_text}"
+
+              ed_pat = rf'(?m)^###\s*{re.escape(ed_title)}\s*$'
+              m_ed = re.search(ed_pat, body)
+              if m_ed:
+                  e_start = m_ed.start()
+                  next_break = re.search(r'(?m)^(\s*---\s*$|###\s+|\*\*Full Changelog\*\*)', body[m_ed.end():])
+                  if next_break:
+                      e_end = m_ed.end() + next_break.start()
+                  else:
+                      e_end = len(body)
+                  body = body[:e_start] + sec_text + "\n\n" + body[e_end:].lstrip()
+              else:
+                  fc_m = re.search(r'(?m)^\*\*Full Changelog\*\*', body)
+                  if fc_m:
+                      insert_pos = fc_m.start()
+                      before_text = body[:insert_pos].rstrip()
+                      if before_text.endswith('### 更新说明'):
+                          insertion = f"\n\n{sec_text}\n\n\n"
+                      else:
+                          insertion = f"\n\n---\n\n{sec_text}\n\n\n"
+                      body = before_text + insertion + body[insert_pos:]
+                  else:
+                      body = body.rstrip() + f"\n\n---\n\n{sec_text}\n"
+
+          body = re.sub(r'---\s*\n\s*---', '---', body)
+
+          with open('release/RELEASE_BODY_UPDATED.md', 'w', encoding='utf-8') as f:
+              f.write(body)
+
+          edit_res = subprocess.run(
+              ['gh', 'release', 'edit', tag, '--repo', repo, '--notes-file', 'release/RELEASE_BODY_UPDATED.md'],
+              capture_output=True, text=True
+          )
+          if edit_res.returncode == 0:
+              print("✨ Release 正文发布说明已成功自动同步！")
+          else:
+              print("⚠️ 更新 Release 说明失败:", edit_res.stderr)
+          EOF
+
+      - name: Build step summary
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          TARGET_REPO: '3899/SimAdmin'
+        run: |
+          python3 - <<'EOF'
+          import os
+
+          ver = os.environ.get('VERSION', '')
+          repo = os.environ.get('TARGET_REPO', '3899/SimAdmin')
+          sums_file = 'release/SHA256SUMS'
+          sums = []
+          if os.path.exists(sums_file):
+              with open(sums_file, 'r', encoding='utf-8') as f:
+                  for line in f:
+                      parts = line.strip().split()
+                      if len(parts) >= 2:
+                          h, fn = parts[0], os.path.basename(parts[1])
+                          sums.append((fn, h))
+
+          table_rows = "\n".join([f"| `{fn}` | `{h}` |" for fn, h in sums])
+          summary = (
+              f"## 🚀 SimAdmin OTA 产物构建与挂载完成 (v{ver})\n\n"
+              f"### 📦 产物包与 SHA-256 校验和\n\n"
+              f"| 文件名 | SHA-256 校验和 |\n"
+              f"| :--- | :--- |\n"
+              f"{table_rows}\n\n"
+              f"---\n"
+              f"🎉 Release 页面: https://github.com/{repo}/releases/tag/v{ver}\n"
+          )
+          step_summary = os.environ.get('GITHUB_STEP_SUMMARY')
+          if step_summary:
+              with open(step_summary, 'a', encoding='utf-8') as f:
+                  f.write(summary)
+          EOF

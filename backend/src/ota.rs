@@ -22,10 +22,9 @@ const OTA_BINARY_PATH: &str = "/opt/simadmin/simadmin";
 const OTA_WWW_PATH: &str = "/opt/simadmin/www";
 const OTA_META_PATH: &str = "/opt/simadmin/meta.json";
 const OTA_SERVICE_NAME: &str = "simadmin.service";
-const NM_CONF_DIR: &str = "/etc/NetworkManager/conf.d";
 const NM_CONF_PATH: &str = "/etc/NetworkManager/conf.d/99-simadmin-unmanaged-modem.conf";
-const NM_UNMANAGED_WWAN_CONFIG: &str = "[keyfile]\nunmanaged-devices=interface-name:wwan*\n";
 const LATEST_RELEASE_API: &str = "https://api.github.com/repos/3899/SimAdmin/releases/latest";
+const CURRENT_TARGET_TRIPLE: &str = env!("APP_TARGET_TRIPLE");
 const BEIJING_UTC_OFFSET_SECONDS: i32 = 8 * 60 * 60;
 const UPDATE_CHECK_HOURS: [u32; 2] = [9, 18];
 const OTA_HTTP_TIMEOUT_SECS: u64 = 30;
@@ -36,6 +35,28 @@ const BUILTIN_PROXY_PREFIXES: [&str; 3] = [
 ];
 pub const MAX_OTA_BYTES: u64 = 50 * 1024 * 1024;
 
+struct StagingCleanupGuard {
+    preserve: bool,
+}
+
+impl StagingCleanupGuard {
+    fn new() -> Self {
+        Self { preserve: false }
+    }
+
+    fn preserve(&mut self) {
+        self.preserve = true;
+    }
+}
+
+impl Drop for StagingCleanupGuard {
+    fn drop(&mut self) {
+        if !self.preserve {
+            let _ = fs::remove_dir_all(OTA_STAGING_DIR);
+        }
+    }
+}
+
 /// 当前版本信息（编译时注入）
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -44,13 +65,106 @@ pub fn get_current_commit() -> String {
     option_env!("GIT_COMMIT").unwrap_or("unknown").to_string()
 }
 
+/// 动态获取/解析当前系统的目标架构三元组
+pub fn resolve_current_target_triple() -> String {
+    // The running binary is the source of truth. Installed metadata can be
+    // stale after moving an image between architectures (for example, an old
+    // ARM64 meta.json on a newly booted ARMv7 device), and must not influence
+    // OTA asset selection or package validation.
+    if let Some(runtime_target) = target_triple_for_host_arch(std::env::consts::ARCH) {
+        return runtime_target.to_string();
+    }
+
+    if let Some(installed) = read_installed_meta() {
+        let arch = installed.arch.trim().to_string();
+        if !arch.is_empty() {
+            return arch;
+        }
+    }
+    CURRENT_TARGET_TRIPLE.to_string()
+}
+
+fn target_triple_for_host_arch(arch: &str) -> Option<&'static str> {
+    match arch {
+        "aarch64" => Some("aarch64-unknown-linux-musl"),
+        "arm" => Some("armv7-unknown-linux-musleabihf"),
+        "x86_64" => Some("x86_64-unknown-linux-musl"),
+        _ => None,
+    }
+}
+
+/// 读取已安装的更新元数据
+fn read_installed_meta() -> Option<OtaMeta> {
+    if let Ok(content) = fs::read_to_string(OTA_META_PATH) {
+        serde_json::from_str(&content).ok()
+    } else {
+        None
+    }
+}
+
+fn resolve_ota_edition(meta: Option<&OtaMeta>) -> String {
+    let Some(meta) = meta else {
+        return "standard".to_string();
+    };
+
+    let edition = meta.edition.as_deref().unwrap_or_default().trim();
+    let lower = edition.to_ascii_lowercase();
+
+    if lower.contains("full")
+        || lower.contains("all")
+        || lower.contains("volte-vowifi")
+        || lower.contains("volte_vowifi")
+        || (lower.contains("volte") && (lower.contains("vowifi") || lower.contains("wfc")))
+    {
+        "full".to_string()
+    } else if meta.wificalling == Some(true)
+        || lower.contains("vowifi")
+        || lower.contains("wfc")
+        || lower.contains("wificalling")
+    {
+        "vowifi".to_string()
+    } else if lower.contains("volte") {
+        "volte".to_string()
+    } else if edition.is_empty() || lower == "standard" {
+        "standard".to_string()
+    } else {
+        edition.to_string()
+    }
+}
+
 /// 获取 OTA 更新状态
 pub fn get_ota_status() -> OtaStatusResponse {
     let pending_meta = read_pending_meta();
+    let installed_meta = read_installed_meta();
+
+    let current_version = installed_meta
+        .as_ref()
+        .map(|m| m.version.clone())
+        .unwrap_or_else(|| CURRENT_VERSION.to_string());
+    let current_commit = installed_meta
+        .as_ref()
+        .map(|m| m.commit.clone())
+        .unwrap_or_else(get_current_commit);
+    let current_build_time = installed_meta.as_ref().map(|m| m.build_time.clone());
+    let current_binary_md5 = installed_meta.as_ref().map(|m| m.binary_md5.clone());
+    let current_frontend_md5 = installed_meta.as_ref().map(|m| m.frontend_md5.clone());
+    let current_arch = installed_meta
+        .as_ref()
+        .map(|m| m.arch.trim())
+        .filter(|arch| !arch.is_empty())
+        .map(str::to_string)
+        .or_else(|| Some(resolve_current_target_triple()));
+    let current_edition = Some(resolve_ota_edition(installed_meta.as_ref()));
 
     OtaStatusResponse {
-        current_version: CURRENT_VERSION.to_string(),
-        current_commit: get_current_commit(),
+        current_version,
+        current_commit,
+        current_build_time,
+        current_binary_md5,
+        current_frontend_md5,
+        current_arch,
+        current_edition,
+        installed_meta,
         pending_update: pending_meta.is_some(),
         pending_meta,
     }
@@ -143,14 +257,192 @@ pub fn ota_request_urls(
 
 pub fn is_supported_ota_asset(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    lower.ends_with(".tar.gz") || lower.ends_with(".tgz") || lower.ends_with(".zip")
+    lower.starts_with("simadmin")
+        && (lower.ends_with(".tar.gz") || lower.ends_with(".tgz") || lower.ends_with(".zip"))
 }
 
-pub fn supported_release_asset(release: &OtaLatestReleaseResponse) -> Option<&OtaReleaseAsset> {
+pub fn is_asset_matching_target_arch(name: &str, target: &str) -> bool {
+    if !is_supported_ota_asset(name) {
+        return false;
+    }
+
+    let lower = name.to_ascii_lowercase();
+    let target = target.to_ascii_lowercase();
+    let target_is_arm64 = target.contains("aarch64") || target.contains("arm64");
+    let target_is_soft_float = (target.contains("musleabi") && !target.contains("musleabihf"))
+        || (target.contains("gnueabi") && !target.contains("gnueabihf"));
+    let target_is_armv7 = !target_is_soft_float
+        && (target.contains("armv7") || target.contains("armhf") || target == "arm");
+    let target_is_amd = target.contains("x86_64") || target.contains("amd64");
+
+    // 显式拒绝架构冲突的产物包
+    if target_is_arm64
+        && (lower.contains("amd64")
+            || lower.contains("x86_64")
+            || lower.contains("armv7")
+            || lower.contains("armhf"))
+    {
+        return false;
+    }
+    if target_is_armv7
+        && (lower.contains("amd64")
+            || lower.contains("x86_64")
+            || lower.contains("aarch64")
+            || lower.contains("arm64"))
+    {
+        return false;
+    }
+    if target_is_amd && (lower.contains("arm64") || lower.contains("aarch64")) {
+        return false;
+    }
+    if target_is_amd && (lower.contains("armv7") || lower.contains("armhf")) {
+        return false;
+    }
+
+    // A fully-qualified package for another libc/ABI (e.g. unknown-linux-gnu vs unknown-linux-musl)
+    // is not a compatible match and must be rejected.
+    if lower.contains("unknown-linux-") && !lower.contains(&target) {
+        return false;
+    }
+
+    let arch_keywords: &[&str] = if target_is_arm64 {
+        &["arm64", "aarch64"]
+    } else if target_is_armv7 {
+        &["armv7", "armv7l", "armhf"]
+    } else if target_is_amd {
+        &["amd64", "x86_64"]
+    } else {
+        &[]
+    };
+
+    if arch_keywords.iter().any(|k| lower.contains(k)) {
+        return true;
+    }
+
+    // Releases before architecture-specific artifacts used an ARM64-only generic name.
+    let is_legacy_generic = matches!(
+        lower.as_str(),
+        "simadmin.tar.gz" | "simadmin.tgz" | "simadmin.zip"
+    );
+    if target_is_arm64 && is_legacy_generic {
+        return true;
+    }
+
+    false
+}
+
+fn ota_asset_score(name: &str, target: &str, target_edition: Option<&str>) -> Option<u8> {
+    if !is_asset_matching_target_arch(name, target) {
+        return None;
+    }
+
+    let lower = name.to_ascii_lowercase();
+    let edition = target_edition.unwrap_or("standard");
+    let is_full = edition.eq_ignore_ascii_case("full")
+        || edition.eq_ignore_ascii_case("all")
+        || edition.to_ascii_lowercase().contains("full")
+        || edition.to_ascii_lowercase().contains("volte-vowifi")
+        || edition.to_ascii_lowercase().contains("volte_vowifi");
+    let is_vowifi = !is_full
+        && (edition.eq_ignore_ascii_case("vowifi")
+            || edition.eq_ignore_ascii_case("wfc")
+            || edition.to_ascii_lowercase().contains("vowifi")
+            || edition.to_ascii_lowercase().contains("wfc"));
+    let is_volte = !is_full
+        && (edition.eq_ignore_ascii_case("volte")
+            || edition.to_ascii_lowercase().contains("volte"));
+
+    let asset_is_full = lower.contains("full")
+        || lower.contains("volte-vowifi")
+        || lower.contains("volte_vowifi")
+        || (lower.contains("volte") && (lower.contains("vowifi") || lower.contains("wfc")));
+    let asset_is_vowifi = !asset_is_full && (lower.contains("vowifi") || lower.contains("wfc"));
+    let asset_is_volte = !asset_is_full && lower.contains("volte");
+
+    let edition_match = if is_full {
+        asset_is_full
+    } else if is_vowifi {
+        asset_is_vowifi
+    } else if is_volte {
+        asset_is_volte
+    } else {
+        !asset_is_full && !asset_is_vowifi && !asset_is_volte
+    };
+
+    if !edition_match {
+        return None;
+    }
+
+    let is_legacy_generic = matches!(
+        lower.as_str(),
+        "simadmin.tar.gz" | "simadmin.tgz" | "simadmin.zip"
+    );
+    if is_legacy_generic {
+        Some(1)
+    } else {
+        Some(3)
+    }
+}
+
+pub fn supported_release_assets_for_arch(
+    release: &OtaLatestReleaseResponse,
+    target_arch: &str,
+) -> Vec<OtaReleaseAsset> {
     release
         .assets
         .iter()
-        .find(|asset| is_supported_ota_asset(&asset.name))
+        .filter(|asset| is_asset_matching_target_arch(&asset.name, target_arch))
+        .cloned()
+        .collect()
+}
+
+pub fn supported_release_assets_for_target(
+    release: &OtaLatestReleaseResponse,
+    target: &str,
+    target_edition: Option<&str>,
+    include_variants: bool,
+) -> Vec<OtaReleaseAsset> {
+    if include_variants {
+        supported_release_assets_for_arch(release, target)
+    } else {
+        supported_release_asset_for_target(release, target, target_edition)
+            .cloned()
+            .into_iter()
+            .collect()
+    }
+}
+
+pub fn supported_release_asset_by_name_for_target<'a>(
+    release: &'a OtaLatestReleaseResponse,
+    target: &str,
+    asset_name: &str,
+) -> Option<&'a OtaReleaseAsset> {
+    release.assets.iter().find(|asset| {
+        asset.name == asset_name && is_asset_matching_target_arch(&asset.name, target)
+    })
+}
+
+fn supported_release_asset_for_target<'a>(
+    release: &'a OtaLatestReleaseResponse,
+    target: &str,
+    target_edition: Option<&str>,
+) -> Option<&'a OtaReleaseAsset> {
+    release
+        .assets
+        .iter()
+        .filter_map(|asset| {
+            ota_asset_score(&asset.name, target, target_edition).map(|score| (score, asset))
+        })
+        .max_by_key(|(score, _)| *score)
+        .map(|(_, asset)| asset)
+}
+
+pub fn supported_release_asset<'a>(
+    release: &'a OtaLatestReleaseResponse,
+    target_edition: Option<&str>,
+) -> Option<&'a OtaReleaseAsset> {
+    let target_triple = resolve_current_target_triple();
+    supported_release_asset_for_target(release, &target_triple, target_edition)
 }
 
 pub async fn fetch_latest_github_release(
@@ -222,7 +514,10 @@ pub async fn check_and_notify_version_update(
         return Ok(());
     }
 
-    let asset = supported_release_asset(&release)
+    let installed_meta = read_installed_meta();
+    let edition = resolve_ota_edition(installed_meta.as_ref());
+
+    let asset = supported_release_asset(&release, Some(&edition))
         .ok_or_else(|| "No supported OTA asset found in latest release".to_string())?;
     let own_number = notification_sender.get_own_number().await;
     let current_time = chrono::Utc::now().to_rfc3339();
@@ -251,7 +546,6 @@ pub async fn check_and_notify_version_update(
 
     Ok(())
 }
-
 
 pub async fn download_ota_asset_bytes(
     client: &reqwest::Client,
@@ -313,7 +607,6 @@ pub async fn download_ota_asset_bytes(
     }
 }
 
-
 /// 读取待安装的更新元数据
 fn read_pending_meta() -> Option<OtaMeta> {
     let meta_path = format!("{}/meta.json", OTA_STAGING_DIR);
@@ -330,6 +623,7 @@ pub fn handle_ota_upload(data: &[u8]) -> Result<OtaUploadResponse, String> {
     let _ = fs::remove_dir_all(OTA_STAGING_DIR);
     fs::create_dir_all(OTA_STAGING_DIR)
         .map_err(|e| format!("Failed to create staging dir: {}", e))?;
+    let mut cleanup_guard = StagingCleanupGuard::new();
 
     // 自动检测文件格式
     let is_zip = detect_zip_format(data);
@@ -401,6 +695,10 @@ pub fn handle_ota_upload(data: &[u8]) -> Result<OtaUploadResponse, String> {
     // 验证
     let validation = validate_ota_package(&meta)?;
 
+    if validation.valid {
+        cleanup_guard.preserve();
+    }
+
     Ok(OtaUploadResponse { meta, validation })
 }
 
@@ -439,8 +737,9 @@ fn validate_ota_package(meta: &OtaMeta) -> Result<OtaValidation, String> {
     // 前端目录存在即可（MD5 跨平台难以保持一致）
     let frontend_md5_match = true; // 跳过前端 MD5 验证
 
-    // 检查架构（只接受 musl）
-    let arch_match = meta.arch == "aarch64-unknown-linux-musl";
+    // OTA 二进制必须与当前运行实例的目标架构一致。
+    let expected_triple = resolve_current_target_triple();
+    let arch_match = is_meta_arch_matching_target(&meta.arch, &expected_triple);
 
     // 比较版本
     let is_newer = compare_versions(&meta.version, CURRENT_VERSION);
@@ -459,8 +758,8 @@ fn validate_ota_package(meta: &OtaMeta) -> Result<OtaValidation, String> {
         }
         if !arch_match {
             errors.push(format!(
-                "Arch mismatch: expected=aarch64-unknown-linux-musl, actual={}",
-                meta.arch
+                "Arch mismatch: expected={}, actual={}",
+                expected_triple, meta.arch
             ));
         }
         Some(errors.join("; "))
@@ -476,6 +775,30 @@ fn validate_ota_package(meta: &OtaMeta) -> Result<OtaValidation, String> {
         arch_match,
         error,
     })
+}
+
+fn is_meta_arch_matching_target(meta_arch: &str, expected_triple: &str) -> bool {
+    let meta_arch = meta_arch.trim().to_ascii_lowercase();
+    let expected = expected_triple.trim().to_ascii_lowercase();
+    if meta_arch == expected {
+        return true;
+    }
+
+    // Never accept a fully-qualified package for a different libc or ABI.
+    if meta_arch.contains("-linux-") {
+        return false;
+    }
+
+    // Keep legacy unqualified aliases for existing ARM64/AMD64 packages. ARMv7
+    // is intentionally strict so a soft-float or ambiguous `armhf` package
+    // cannot pass validation.
+    if expected.contains("aarch64") || expected.contains("arm64") {
+        return matches!(meta_arch.as_str(), "aarch64" | "arm64");
+    }
+    if expected.contains("x86_64") || expected.contains("amd64") {
+        return matches!(meta_arch.as_str(), "x86_64" | "amd64");
+    }
+    false
 }
 
 /// 计算文件 MD5
@@ -521,10 +844,23 @@ fn beijing_offset() -> FixedOffset {
     FixedOffset::east_opt(BEIJING_UTC_OFFSET_SECONDS).expect("valid Beijing UTC offset")
 }
 
-
 /// 应用 OTA 更新
 pub fn apply_ota_update(restart_now: bool) -> Result<String, String> {
     let meta = read_pending_meta().ok_or_else(|| "No pending update".to_string())?;
+    let validation = match validate_ota_package(&meta) {
+        Ok(validation) => validation,
+        Err(error) => {
+            let _ = fs::remove_dir_all(OTA_STAGING_DIR);
+            return Err(error);
+        }
+    };
+    if !validation.valid {
+        let error = validation
+            .error
+            .unwrap_or_else(|| "Pending OTA package validation failed".to_string());
+        let _ = fs::remove_dir_all(OTA_STAGING_DIR);
+        return Err(error);
+    }
 
     let staging_binary = format!("{}/simadmin", OTA_STAGING_DIR);
     let staging_www = format!("{}/www", OTA_STAGING_DIR);
@@ -537,7 +873,7 @@ pub fn apply_ota_update(restart_now: bool) -> Result<String, String> {
     chmod_www_tree(OTA_WWW_PATH)?;
 
     install_meta_file()?;
-    let nm_result = configure_networkmanager_modem_unmanaged(restart_now);
+    let nm_result = remove_legacy_networkmanager_modem_unmanaged();
 
     // 清理暂存目录
     let _ = fs::remove_dir_all(OTA_STAGING_DIR);
@@ -557,49 +893,14 @@ pub fn apply_ota_update(restart_now: bool) -> Result<String, String> {
     Ok(message)
 }
 
-fn configure_networkmanager_modem_unmanaged(restart_now: bool) -> String {
-    if !Path::new("/etc/NetworkManager").exists() {
-        return "NetworkManager not installed, unmanaged modem config skipped".to_string();
-    }
-
-    if let Ok(content) = fs::read_to_string(NM_CONF_PATH) {
-        if content == NM_UNMANAGED_WWAN_CONFIG {
-            return "NetworkManager already ignores wwan*".to_string();
+fn remove_legacy_networkmanager_modem_unmanaged() -> String {
+    if Path::new(NM_CONF_PATH).exists() {
+        if let Err(err) = fs::remove_file(NM_CONF_PATH) {
+            return format!("Failed to remove legacy NetworkManager unmanaged modem config: {err}");
         }
+        return "Removed legacy NetworkManager unmanaged modem config".to_string();
     }
-
-    if let Err(err) = fs::create_dir_all(NM_CONF_DIR) {
-        return format!("Failed to create NetworkManager conf.d: {err}");
-    }
-    if let Err(err) = fs::write(NM_CONF_PATH, NM_UNMANAGED_WWAN_CONFIG) {
-        return format!("Failed to write NetworkManager unmanaged modem config: {err}");
-    }
-
-    if !restart_now {
-        return "NetworkManager config written; service restart deferred".to_string();
-    }
-
-    match Command::new("systemctl")
-        .args(["is-active", "--quiet", "NetworkManager.service"])
-        .status()
-    {
-        Ok(status) if status.success() => {
-            match Command::new("systemctl")
-                .args(["restart", "NetworkManager.service"])
-                .output()
-            {
-                Ok(output) if output.status.success() => {
-                    "NetworkManager configured to ignore wwan*, service restarted".to_string()
-                }
-                Ok(output) => format!(
-                    "NetworkManager config written, restart failed: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                ),
-                Err(err) => format!("NetworkManager config written, restart failed: {err}"),
-            }
-        }
-        _ => "NetworkManager configured to ignore wwan*, service not active".to_string(),
-    }
+    "No legacy NetworkManager unmanaged config found".to_string()
 }
 
 fn install_binary_atomic(src: &str, dst: &str) -> Result<(), String> {
@@ -738,6 +1039,30 @@ fn detect_zip_format(data: &[u8]) -> bool {
     data[0] == 0x50 && data[1] == 0x4B && data[2] == 0x03 && data[3] == 0x04
 }
 
+/// 修复文件权限（用于 ZIP 解压后）
+fn fix_file_permissions() -> Result<(), String> {
+    let binary_path = format!("{}/simadmin", OTA_STAGING_DIR);
+    let www_path = format!("{}/www", OTA_STAGING_DIR);
+
+    if Path::new(&binary_path).exists() {
+        Command::new("chmod")
+            .args(["755", &binary_path])
+            .output()
+            .map_err(|e| format!("Failed to chmod binary: {}", e))?;
+    }
+
+    if Path::new(&www_path).exists() {
+        let _ = Command::new("find")
+            .args([&www_path, "-type", "d", "-exec", "chmod", "755", "{}", "+"])
+            .output();
+        let _ = Command::new("find")
+            .args([&www_path, "-type", "f", "-exec", "chmod", "644", "{}", "+"])
+            .output();
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -747,6 +1072,372 @@ mod tests {
         assert!(compare_versions("v1.0.4", "1.0.3"));
         assert!(!compare_versions("v1.0.3", "1.0.3"));
         assert!(!compare_versions("v1.0.2", "1.0.3"));
+    }
+
+    #[test]
+    fn maps_rust_arm_host_arch_to_debian_armv7_target() {
+        assert_eq!(
+            target_triple_for_host_arch("arm"),
+            Some("armv7-unknown-linux-musleabihf")
+        );
+        assert_eq!(
+            target_triple_for_host_arch("aarch64"),
+            Some("aarch64-unknown-linux-musl")
+        );
+        assert_eq!(target_triple_for_host_arch("armv7l"), None);
+    }
+
+    #[test]
+    fn selects_all_release_assets_for_requested_architecture() {
+        let release = OtaLatestReleaseResponse {
+            assets: vec![
+                OtaReleaseAsset {
+                    name: "simadmin-aarch64.tar.gz".to_string(),
+                    ..Default::default()
+                },
+                OtaReleaseAsset {
+                    name: "simadmin-wfc-aarch64.tar.gz".to_string(),
+                    ..Default::default()
+                },
+                OtaReleaseAsset {
+                    name: "simadmin-x86_64.tar.gz".to_string(),
+                    ..Default::default()
+                },
+                OtaReleaseAsset {
+                    name: "simadmin-wfc-x86_64.tar.gz".to_string(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let arm_assets = supported_release_assets_for_arch(&release, "aarch64-unknown-linux-musl");
+        let arm_names: Vec<&str> = arm_assets.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(
+            arm_names,
+            vec!["simadmin-aarch64.tar.gz", "simadmin-wfc-aarch64.tar.gz"]
+        );
+
+        let x86_assets = supported_release_assets_for_arch(&release, "x86_64-unknown-linux-musl");
+        let x86_names: Vec<&str> = x86_assets.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(
+            x86_names,
+            vec!["simadmin-x86_64.tar.gz", "simadmin-wfc-x86_64.tar.gz"]
+        );
+    }
+
+    #[test]
+    fn selects_named_release_asset_only_for_matching_architecture() {
+        let release = OtaLatestReleaseResponse {
+            assets: vec![
+                OtaReleaseAsset {
+                    name: "simadmin-wfc-aarch64.tar.gz".to_string(),
+                    ..Default::default()
+                },
+                OtaReleaseAsset {
+                    name: "simadmin-wfc-x86_64.tar.gz".to_string(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            supported_release_asset_by_name_for_target(
+                &release,
+                "aarch64-unknown-linux-musl",
+                "simadmin-wfc-aarch64.tar.gz",
+            )
+            .map(|asset| asset.name.as_str()),
+            Some("simadmin-wfc-aarch64.tar.gz")
+        );
+        assert!(supported_release_asset_by_name_for_target(
+            &release,
+            "aarch64-unknown-linux-musl",
+            "simadmin-wfc-x86_64.tar.gz",
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn keeps_single_asset_responses_for_clients_without_variant_support() {
+        let release = OtaLatestReleaseResponse {
+            assets: vec![
+                OtaReleaseAsset {
+                    name: "simadmin-aarch64.tar.gz".to_string(),
+                    ..Default::default()
+                },
+                OtaReleaseAsset {
+                    name: "simadmin-wfc-aarch64.tar.gz".to_string(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let legacy_assets = supported_release_assets_for_target(
+            &release,
+            "aarch64-unknown-linux-musl",
+            Some("standard"),
+            false,
+        );
+        let variant_assets = supported_release_assets_for_target(
+            &release,
+            "aarch64-unknown-linux-musl",
+            Some("standard"),
+            true,
+        );
+
+        assert_eq!(legacy_assets.len(), 1);
+        assert_eq!(legacy_assets[0].name, "simadmin-aarch64.tar.gz");
+        assert_eq!(variant_assets.len(), 2);
+    }
+
+    #[test]
+    fn resolves_vowifi_and_volte_and_full_edition_from_metadata() {
+        let explicit_edition = OtaMeta {
+            edition: Some("WFC-enhanced".to_string()),
+            ..Default::default()
+        };
+        let explicit_vowifi = OtaMeta {
+            edition: Some("VoWiFi".to_string()),
+            ..Default::default()
+        };
+        let explicit_volte = OtaMeta {
+            edition: Some("VoLTE".to_string()),
+            ..Default::default()
+        };
+        let explicit_full = OtaMeta {
+            edition: Some("Full".to_string()),
+            ..Default::default()
+        };
+        let explicit_volte_vowifi = OtaMeta {
+            edition: Some("volte-vowifi".to_string()),
+            ..Default::default()
+        };
+        let legacy_flag = OtaMeta {
+            wificalling: Some(true),
+            ..Default::default()
+        };
+
+        assert_eq!(resolve_ota_edition(Some(&explicit_edition)), "vowifi");
+        assert_eq!(resolve_ota_edition(Some(&explicit_vowifi)), "vowifi");
+        assert_eq!(resolve_ota_edition(Some(&explicit_volte)), "volte");
+        assert_eq!(resolve_ota_edition(Some(&explicit_full)), "full");
+        assert_eq!(resolve_ota_edition(Some(&explicit_volte_vowifi)), "full");
+        assert_eq!(resolve_ota_edition(Some(&legacy_flag)), "vowifi");
+        assert_eq!(resolve_ota_edition(None), "standard");
+    }
+
+    #[test]
+    fn selects_full_edition_release_asset() {
+        let release = OtaLatestReleaseResponse {
+            assets: vec![
+                OtaReleaseAsset {
+                    name: "simadmin-aarch64.tar.gz".to_string(),
+                    ..Default::default()
+                },
+                OtaReleaseAsset {
+                    name: "simadmin-volte-aarch64.tar.gz".to_string(),
+                    ..Default::default()
+                },
+                OtaReleaseAsset {
+                    name: "simadmin-vowifi-aarch64.tar.gz".to_string(),
+                    ..Default::default()
+                },
+                OtaReleaseAsset {
+                    name: "simadmin-full-aarch64.tar.gz".to_string(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let selected = supported_release_asset_for_target(
+            &release,
+            "aarch64-unknown-linux-musl",
+            Some("full"),
+        );
+        assert_eq!(
+            selected.map(|a| a.name.as_str()),
+            Some("simadmin-full-aarch64.tar.gz")
+        );
+
+        let selected_volte = supported_release_asset_for_target(
+            &release,
+            "aarch64-unknown-linux-musl",
+            Some("volte"),
+        );
+        assert_eq!(
+            selected_volte.map(|a| a.name.as_str()),
+            Some("simadmin-volte-aarch64.tar.gz")
+        );
+    }
+
+    #[test]
+    fn selects_the_release_asset_for_the_requested_architecture() {
+        let release = OtaLatestReleaseResponse {
+            assets: vec![
+                OtaReleaseAsset {
+                    name: "simadmin.tar.gz".to_string(),
+                    ..Default::default()
+                },
+                OtaReleaseAsset {
+                    name: "simadmin-arm64.tar.gz".to_string(),
+                    ..Default::default()
+                },
+                OtaReleaseAsset {
+                    name: "simadmin-amd64.tar.gz".to_string(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            supported_release_asset_for_target(&release, "aarch64-unknown-linux-musl", None)
+                .map(|asset| asset.name.as_str()),
+            Some("simadmin-arm64.tar.gz")
+        );
+        assert_eq!(
+            supported_release_asset_for_target(&release, "x86_64-unknown-linux-musl", None)
+                .map(|asset| asset.name.as_str()),
+            Some("simadmin-amd64.tar.gz")
+        );
+    }
+
+    #[test]
+    fn selects_armv7_assets_without_accepting_other_arm_variants() {
+        let release = OtaLatestReleaseResponse {
+            assets: vec![
+                OtaReleaseAsset {
+                    name: "simadmin-armv7.tar.gz".to_string(),
+                    ..Default::default()
+                },
+                OtaReleaseAsset {
+                    name: "simadmin-armhf.tar.gz".to_string(),
+                    ..Default::default()
+                },
+                OtaReleaseAsset {
+                    name: "simadmin-aarch64.tar.gz".to_string(),
+                    ..Default::default()
+                },
+                OtaReleaseAsset {
+                    name: "simadmin-x86_64.tar.gz".to_string(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let assets = supported_release_assets_for_arch(&release, "armv7-unknown-linux-musleabihf");
+        let names: Vec<&str> = assets.iter().map(|asset| asset.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["simadmin-armv7.tar.gz", "simadmin-armhf.tar.gz"]
+        );
+        assert!(!is_asset_matching_target_arch(
+            "simadmin-aarch64.tar.gz",
+            "armv7-unknown-linux-musleabihf"
+        ));
+        assert!(!is_asset_matching_target_arch(
+            "simadmin-armv7-unknown-linux-musleabi.tar.gz",
+            "armv7-unknown-linux-musleabihf"
+        ));
+        assert!(!is_asset_matching_target_arch(
+            "simadmin-armv7.tar.gz",
+            "armv7-unknown-linux-musleabi"
+        ));
+    }
+
+    #[test]
+    fn legacy_generic_asset_is_not_selected_for_armv7() {
+        let release = OtaLatestReleaseResponse {
+            assets: vec![OtaReleaseAsset {
+                name: "simadmin.tar.gz".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        assert!(supported_release_asset_for_target(
+            &release,
+            "armv7-unknown-linux-musleabihf",
+            None,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn generic_legacy_asset_is_arm64_only() {
+        let release = OtaLatestReleaseResponse {
+            assets: vec![OtaReleaseAsset {
+                name: "simadmin.tar.gz".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        assert!(
+            supported_release_asset_for_target(&release, "aarch64-unknown-linux-musl", None)
+                .is_some()
+        );
+        assert!(
+            supported_release_asset_for_target(&release, "x86_64-unknown-linux-musl", None)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn rejects_a_fully_qualified_asset_for_another_abi() {
+        let release = OtaLatestReleaseResponse {
+            assets: vec![OtaReleaseAsset {
+                name: "simadmin-x86_64-unknown-linux-gnu.tar.gz".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        assert!(
+            supported_release_asset_for_target(&release, "x86_64-unknown-linux-musl", None)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn requires_full_armv7_target_in_ota_metadata() {
+        let target = "armv7-unknown-linux-musleabihf";
+        assert!(is_meta_arch_matching_target(target, target));
+        assert!(!is_meta_arch_matching_target("armv7", target));
+        assert!(!is_meta_arch_matching_target("armhf", target));
+        assert!(!is_meta_arch_matching_target(
+            "armv7-unknown-linux-musleabi",
+            target
+        ));
+        assert!(!is_meta_arch_matching_target(
+            "armv7-unknown-linux-gnueabihf",
+            target
+        ));
+    }
+
+    #[test]
+    fn rejects_fully_qualified_wrong_abi_in_ota_metadata() {
+        assert!(!is_meta_arch_matching_target(
+            "aarch64-unknown-linux-gnu",
+            "aarch64-unknown-linux-musl"
+        ));
+        assert!(!is_meta_arch_matching_target(
+            "x86_64-unknown-linux-gnu",
+            "x86_64-unknown-linux-musl"
+        ));
+        assert!(is_meta_arch_matching_target(
+            "arm64",
+            "aarch64-unknown-linux-musl"
+        ));
+        assert!(is_meta_arch_matching_target(
+            "amd64",
+            "x86_64-unknown-linux-musl"
+        ));
     }
 
     #[test]
@@ -807,33 +1498,4 @@ mod tests {
             ]
         );
     }
-}
-
-/// 修复文件权限（用于 ZIP 解压后）
-fn fix_file_permissions() -> Result<(), String> {
-    let binary_path = format!("{}/simadmin", OTA_STAGING_DIR);
-    let www_path = format!("{}/www", OTA_STAGING_DIR);
-
-    // 设置二进制文件权限为 755（可执行）
-    if Path::new(&binary_path).exists() {
-        Command::new("chmod")
-            .args(["755", &binary_path])
-            .output()
-            .map_err(|e| format!("Failed to chmod binary: {}", e))?;
-    }
-
-    // 设置前端文件权限：目录 755，文件 644
-    if Path::new(&www_path).exists() {
-        // 所有目录设置为 755
-        let _ = Command::new("find")
-            .args([&www_path, "-type", "d", "-exec", "chmod", "755", "{}", "+"])
-            .output();
-
-        // 所有文件设置为 644
-        let _ = Command::new("find")
-            .args([&www_path, "-type", "f", "-exec", "chmod", "644", "{}", "+"])
-            .output();
-    }
-
-    Ok(())
 }

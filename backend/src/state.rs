@@ -14,6 +14,7 @@ use crate::config::ConfigManager;
 use crate::db::Database;
 use crate::device_network::DdnsManager;
 use crate::esim::EsimSupervisor;
+use crate::hub_agent::HubAgentManager;
 use crate::notification::NotificationSender;
 use crate::sms_listener::SmsResyncHandle;
 use crate::system_event::SystemEventEmitter;
@@ -51,23 +52,39 @@ pub struct AppState {
     pub airplane_mode_requested: Arc<AtomicBool>,
     /// 小区/信号轮询是否已按需唤醒。
     pub cell_monitoring_active: Arc<AtomicBool>,
+    pub hub_agent_manager: Arc<HubAgentManager>,
+}
+
+pub struct AppStateDependencies {
+    pub dbus_conn: Arc<Connection>,
+    pub database: Arc<Database>,
+    pub config_manager: Arc<ConfigManager>,
+    pub notification_sender: Arc<NotificationSender>,
+    pub system_event_emitter: Arc<SystemEventEmitter>,
+    pub ddns_manager: Arc<DdnsManager>,
+    pub esim_supervisor: Arc<EsimSupervisor>,
+    pub sms_resync: SmsResyncHandle,
+    pub data_user_disabled: Arc<AtomicBool>,
+    pub airplane_mode_requested: Arc<AtomicBool>,
+    pub cell_monitoring_active: Arc<AtomicBool>,
 }
 
 impl AppState {
     /// 创建新的应用状态
-    pub fn new(
-        dbus_conn: Arc<Connection>,
-        database: Arc<Database>,
-        config_manager: Arc<ConfigManager>,
-        notification_sender: Arc<NotificationSender>,
-        system_event_emitter: Arc<SystemEventEmitter>,
-        ddns_manager: Arc<DdnsManager>,
-        esim_supervisor: Arc<EsimSupervisor>,
-        sms_resync: SmsResyncHandle,
-        data_user_disabled: Arc<AtomicBool>,
-        airplane_mode_requested: Arc<AtomicBool>,
-        cell_monitoring_active: Arc<AtomicBool>,
-    ) -> Self {
+    pub fn new(dependencies: AppStateDependencies) -> Self {
+        let AppStateDependencies {
+            dbus_conn,
+            database,
+            config_manager,
+            notification_sender,
+            system_event_emitter,
+            ddns_manager,
+            esim_supervisor,
+            sms_resync,
+            data_user_disabled,
+            airplane_mode_requested,
+            cell_monitoring_active,
+        } = dependencies;
         Self {
             dbus_conn,
             database,
@@ -83,6 +100,7 @@ impl AppState {
             data_user_disabled,
             airplane_mode_requested,
             cell_monitoring_active,
+            hub_agent_manager: Arc::new(HubAgentManager::new()),
         }
     }
 }

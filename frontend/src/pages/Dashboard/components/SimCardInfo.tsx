@@ -23,14 +23,16 @@ import {
 } from '@mui/icons-material'
 import { getSensitiveStyle } from '../utils'
 import type { SimInfo } from '@/api/types'
-import { api } from '@/api/current'
+import { useSimAdminApi } from '@/contexts/ApiContext'
 
 interface SimCardInfoProps {
   simInfo: SimInfo | null
   onRefresh?: () => void
+  readOnly?: boolean
 }
 
-export function SimCardInfo({ simInfo, onRefresh }: SimCardInfoProps) {
+export function SimCardInfo({ simInfo, onRefresh, readOnly = false }: SimCardInfoProps) {
+  const api = useSimAdminApi()
   const [showInfo, setShowInfo] = useState(false)
   const [editingPhone, setEditingPhone] = useState(false)
   const [editingSmsc, setEditingSmsc] = useState(false)
@@ -110,8 +112,8 @@ export function SimCardInfo({ simInfo, onRefresh }: SimCardInfoProps) {
             <SimCard color="primary" />
             <Typography variant="subtitle1" fontWeight={700}>SIM 卡信息</Typography>
             <Chip
-              label={simInfo?.present ? '已插入' : '未插入'}
-              color={simInfo?.present ? 'success' : 'error'}
+              label={simInfo === null ? '检测中...' : (simInfo.present ? '已插入' : '未插入')}
+              color={simInfo === null ? 'default' : (simInfo.present ? 'success' : 'error')}
               size="small"
               variant="outlined"
               sx={{ ml: 'auto' }}
@@ -126,8 +128,8 @@ export function SimCardInfo({ simInfo, onRefresh }: SimCardInfoProps) {
           <Stack spacing={1.5}>
             <Box display="flex" justifyContent="space-between" alignItems="center" gap={2}>
               <Typography variant="caption" color="text.secondary">ICCID</Typography>
-              <Typography variant="body2" sx={{ ...valueTextSx, ...getSensitiveStyle(showInfo) }}>
-                {simInfo?.iccid || 'N/A'}
+              <Typography data-sensitive="true" variant="body2" sx={{ ...valueTextSx, ...getSensitiveStyle(showInfo) }}>
+                {simInfo?.iccid || (simInfo === null ? '读取中...' : 'N/A')}
               </Typography>
             </Box>
 
@@ -153,10 +155,10 @@ export function SimCardInfo({ simInfo, onRefresh }: SimCardInfoProps) {
                 </Box>
               ) : (
                 <Box display="flex" alignItems="center" gap={0.5}>
-                  <Typography variant="body2" sx={{ ...valueTextSx, ...getSensitiveStyle(showInfo) }}>
-                    {!isPhoneEmpty ? simInfo.phone_numbers[0] : 'N/A'}
+                  <Typography data-sensitive="true" variant="body2" sx={{ ...valueTextSx, ...getSensitiveStyle(showInfo) }}>
+                    {!isPhoneEmpty ? simInfo.phone_numbers[0] : (simInfo === null ? '读取中...' : 'N/A')}
                   </Typography>
-                  {showInfo && (isPhoneEmpty || simInfo?.phone_number_is_manual) && simInfo?.present && (
+                  {!readOnly && showInfo && (isPhoneEmpty || simInfo?.phone_number_is_manual) && simInfo?.present && (
                     <IconButton size="small" onClick={() => { setPhoneInput(simInfo?.phone_numbers?.[0] || ''); setEditingPhone(true); }}>
                       <Edit sx={{ fontSize: '1rem' }} />
                     </IconButton>
@@ -187,10 +189,10 @@ export function SimCardInfo({ simInfo, onRefresh }: SimCardInfoProps) {
                 </Box>
               ) : (
                 <Box display="flex" alignItems="center" gap={0.5}>
-                  <Typography variant="body2" sx={{ ...valueTextSx, ...getSensitiveStyle(showInfo) }}>
-                    {!isSmscEmpty ? simInfo.sms_center : '未读取到'}
+                  <Typography data-sensitive="true" variant="body2" sx={{ ...valueTextSx, ...getSensitiveStyle(showInfo) }}>
+                    {!isSmscEmpty ? simInfo.sms_center : (simInfo === null ? '读取中...' : '未读取到')}
                   </Typography>
-                  {showInfo && (isSmscEmpty || simInfo?.sms_center_is_manual) && simInfo?.present && (
+                  {!readOnly && showInfo && (isSmscEmpty || simInfo?.sms_center_is_manual) && simInfo?.present && (
                     <IconButton size="small" onClick={() => { setSmscInput(simInfo?.sms_center || ''); setEditingSmsc(true); }}>
                       <Edit sx={{ fontSize: '1rem' }} />
                     </IconButton>
@@ -202,7 +204,7 @@ export function SimCardInfo({ simInfo, onRefresh }: SimCardInfoProps) {
             <Box display="flex" justifyContent="space-between" alignItems="center" gap={2}>
               <Typography variant="caption" color="text.secondary">MCC/MNC</Typography>
               <Typography variant="body2" sx={valueTextSx}>
-                {simInfo?.mcc || '?'}/{simInfo?.mnc || '?'}
+                {simInfo === null ? '-/-' : `${simInfo.mcc || '?'}/${simInfo.mnc || '?'}`}
               </Typography>
             </Box>
           </Stack>

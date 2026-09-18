@@ -3,17 +3,20 @@
 ## 目标设备运行要求
 
 - **操作系统**：Linux / Debian 系统。
+- **CPU 架构**：ARM64 (`aarch64`)、ARMv7 hard-float (`armhf`/`armv7l`) 或 x86_64 (`amd64`)；安装与 OTA 包必须和设备架构及 ABI 一致。
 - **系统管理器**：systemd。
 - **权限**：需要 root 运行权限。
 - **IPC 机制**：system D-Bus。
 - **核心依赖包与指令**：
   - `ModemManager` 和 `mmcli`
   - `NetworkManager` 和 `nmcli`
-  - `qmicli`（用于基站定位/网络小区信息兜底读取）
-  - `iptables` / `ip6tables`（仅用于网络通路只读诊断；本程序不会自动修改或清空防火墙规则）
+  - `qmicli` / `mbimcli`（按实际 modem 协议安装；用于网络和小区信息兜底读取）
+  - `libqmi` / `libmbim` / `libpcsclite`（仅支持 lpac 的架构按需安装；ARMv7 MVP 不安装）
+  - `iptables` / `ip6tables`（可选，只用于网络通路只读诊断；本程序不会自动修改或清空防火墙规则）
   - `ip` / `ifconfig` / `route`（用于网络状态诊断，其中 `ifconfig` 和 `route` 需确保系统已安装 `net-tools`）
   - `tar`（OTA 包解压必需）
-  - `unzip` / `busybox unzip` / `python3`（用于自动解压及下载的 `lpac`；`unzip` 也用于手动上传 zip 格式 OTA 包）
+  - `curl` 和 `ca-certificates`（安装脚本下载 Release 与 HTTPS 校验，作为显式安装依赖）
+  - `unzip`（默认安装，用于手动上传 zip 格式 OTA 包和 lpac；lpac 下载路径也可使用内置解压能力）
 - **eSIM 芯片管理**：eSIM 模式下的芯片/配置管理依赖开源的 `lpac` 辅助程序。
 
 ---
@@ -28,12 +31,13 @@
 | `/opt/simadmin/data.db` | SQLite 数据库文件（保存短信记录、登录认证密码散列值、会话 Token、自动化日志等） |
 | `/opt/simadmin/meta.json` | 记录当前安装包的 OTA 元数据（版本、构建时间、二进制 MD5 等） |
 | `/data/config.json` | 优先加载的系统运行持久化配置文件 |
+| `/data/hub-agent.db` | 集中管理模式的 Agent 安装身份、Hub 元数据、可靠消息 outbox 与命令账本；旧路径会在升级时迁移 |
 | `/opt/simadmin/config.json` | `/data` 目录不存在时，回退加载的系统配置文件 |
 | `/tmp/ota_staging` | 上传 OTA 包后的临时校验与备份解压目录 |
 | `/etc/systemd/system/simadmin.service` | SimAdmin 后端主服务守护单元 |
 | `/etc/systemd/system/simadmin-modem-recovery.service` | 开机 modem 搜网异常自愈恢复服务单元 |
 | `/usr/local/bin/simadmin-modem-recovery.sh` | 开机自愈监控与搜网状态恢复的执行脚本 |
-| `/etc/NetworkManager/conf.d/99-simadmin-unmanaged-modem.conf` | NetworkManager 忽略托管 `wwan*` 接口配置，避免与主服务抢占调制解调器控制权 |
+| `/etc/NetworkManager/conf.d/99-simadmin-unmanaged-modem.conf` | 仅为旧版本遗留配置；新安装会删除它，使 NetworkManager 可以管理蜂窝连接 |
 
 ---
 
@@ -44,15 +48,17 @@
 * **普通 SIM 模式**：「SIM 卡管理」页面中将隐藏「eSIM 管理」标签页，`/api/esim/*` 所有相关接口返回 `403`，前端不加载 eSIM 关联页面 chunk 资源，后端不会主动拉起或调用 `lpac`。
 * **eSIM 模式**：切换到 eSIM 模式后，只有切入「eSIM 管理」Tab 页或用户执行 Profile 写卡、切换、重命名等操作时，后端才会按需调用 `lpac chip info`、`lpac profile list`、`lpac profile enable`、`lpac profile nickname` 和 `lpac profile delete` 进行瞬时通信。
 * **`lpac` 下载与维护**：
-  - 一键安装脚本 `install_latest.sh` 会根据 `uname -m` 和 glibc 版本，优先匹配架构并拉取 ESTK 的 `lpac` 静态编译程序至 `/opt/simadmin/lpac/lpac`。如果系统已存在可用版本则跳过下载。如果需要阻止脚本下载，请在安装时设置环境变量 `SIMADMIN_INSTALL_LPAC=0`。
+  - 一键安装脚本 `install_latest.sh` 会根据 `uname -m` 和 glibc 版本，优先匹配架构并拉取带 QMI、MBIM、AT APDU 后端的 `lpac` 至 `/opt/simadmin/lpac/lpac`。脚本通过 `lpac driver list` 校验 APDU 与 `curl` 驱动，缺少所需驱动或动态库时不会覆盖已有可用版本。如果需要阻止脚本下载，请在安装时设置环境变量 `SIMADMIN_INSTALL_LPAC=0`。
+  - SimAdmin 本机后端默认自动选择 `/dev/cdc-wdm*` QMI 设备，并兼容 `/dev/wwan*qmi*`；仍可通过 `LPAC_APDU_QMI_DEVICE` 显式覆盖。共享运行时可为 SimAdminHub Host Agent 按设备显式选择 QMI、MBIM 或 AT 端点，多个模组不会共用默认控制口。
   - 单独手动应用 OTA 包**不会**自动安装或升级 `lpac`。
+  - ARMv7 MVP 暂不提供 ARMv7 `lpac` 兼容包；前端隐藏“工作模式”和 eSIM 管理入口，后端仍对直接 eSIM/lpac API 调用做架构拒绝，且安装脚本不会下载 ARM64 lpac。
   - 若系统检测到有 eSIM 支持却缺失 `lpac`，管理页面会提供「安装/修复 lpac」的便捷入口。其内部修复逻辑由后端内置 zip 解压引擎在内存中运行完成，不依赖外部环境命令。
 
 ## systemd 服务配置说明
 
 ### 主服务守护单元 (`simadmin.service`)
 
-默认配置位于 `scripts/simadmin.service`：
+默认配置位于 `scripts/system/simadmin.service`：
 
 - `WorkingDirectory=/opt/simadmin`
 - `ExecStart=/opt/simadmin/simadmin`

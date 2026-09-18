@@ -23,6 +23,17 @@ pub struct SmsMessage {
     pub pdu: Option<String>,  // 原始 PDU（如果有）
 }
 
+#[derive(Debug, Clone)]
+pub struct HubEventRecord {
+    pub item_id: String,
+    pub event_type: String,
+    pub event_code: String,
+    pub occurred_at: String,
+    pub summary: String,
+    pub details: serde_json::Value,
+    pub local_fallback_applied: bool,
+}
+
 /// 通话记录
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CallRecord {
@@ -82,6 +93,16 @@ pub struct AutomationLogEntry {
 pub struct AutomationLogsResponse {
     pub logs: Vec<AutomationLogEntry>,
     pub total: i64,
+}
+
+pub struct LogQuery<'a> {
+    pub kind: &'a str,
+    pub status: &'a str,
+    pub search: &'a str,
+    pub start_date: &'a str,
+    pub end_date: &'a str,
+    pub limit: i64,
+    pub offset: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -175,14 +196,6 @@ pub struct SmscCacheEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OwnNumberCacheEntry {
     pub phone_numbers: Vec<String>,
-    pub source: String,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SmsStorageCacheEntry {
-    pub sms_used: Option<u32>,
-    pub sms_total: Option<u32>,
     pub source: String,
     pub updated_at: String,
 }
@@ -403,6 +416,12 @@ impl Database {
                 [],
             )?;
         }
+        if !table_has_column(&conn, "sms_messages", "hub_sync_status")? {
+            conn.execute(
+                "ALTER TABLE sms_messages ADD COLUMN hub_sync_status TEXT NOT NULL DEFAULT 'pending'",
+                [],
+            )?;
+        }
 
         // 创建短信索引
         conn.execute(
@@ -418,6 +437,32 @@ impl Database {
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_sms_notification_status ON sms_messages(notification_status)",
             [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sms_hub_sync ON sms_messages(hub_sync_status,id)",
+            [],
+        )?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS hub_notification_events (
+                item_id TEXT PRIMARY KEY,
+                event_type TEXT NOT NULL,
+                event_code TEXT NOT NULL,
+                occurred_at TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                details_json TEXT NOT NULL,
+                sync_status TEXT NOT NULL DEFAULT 'pending',
+                local_fallback_applied INTEGER NOT NULL DEFAULT 0,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_hub_notification_sync
+                ON hub_notification_events(sync_status,created_at);
+            CREATE TABLE IF NOT EXISTS hub_sms_deleted_events (
+                item_id TEXT PRIMARY KEY,
+                sync_status TEXT NOT NULL DEFAULT 'pending',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_hub_sms_deleted_sync
+                ON hub_sms_deleted_events(sync_status, created_at);",
         )?;
         normalize_existing_sms_timestamps(&conn)?;
 
@@ -649,6 +694,25 @@ impl Database {
         })
     }
 
+    pub(crate) fn with_connection<T, F>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&Connection) -> Result<T>,
+    {
+        let conn = self.conn.lock().unwrap();
+        f(&conn)
+    }
+
+    pub(crate) fn with_transaction<T, F>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&rusqlite::Transaction<'_>) -> Result<T>,
+    {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let result = f(&tx)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
     // ==================== 认证相关方法 ====================
 
     pub fn auth_is_configured(&self) -> Result<bool> {
@@ -745,6 +809,12 @@ impl Database {
             "DELETE FROM auth_sessions WHERE session_hash = ?1",
             params![session_hash],
         )?;
+        Ok(())
+    }
+
+    pub fn clear_auth_sessions(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM auth_sessions", [])?;
         Ok(())
     }
 
@@ -891,6 +961,161 @@ impl Database {
         }
     }
 
+    pub fn get_unsynced_sms_messages(&self, limit: i64) -> Result<Vec<SmsMessage>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id,direction,phone_number,content,timestamp,status,pdu
+             FROM sms_messages WHERE hub_sync_status!='synced' ORDER BY id LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit], sms_message_from_row)?;
+        rows.collect()
+    }
+
+    pub fn mark_sms_hub_synced(&self, id: i64) -> Result<usize> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE sms_messages SET hub_sync_status='synced' WHERE id=?1",
+            [id],
+        )
+    }
+
+    pub fn reset_sms_hub_sync(&self) -> Result<usize> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE sms_messages SET hub_sync_status='pending' WHERE hub_sync_status!='pending'",
+            [],
+        )
+    }
+
+    pub fn enqueue_sms_deleted(&self, item_ids: &[String]) -> Result<()> {
+        if item_ids.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "INSERT OR IGNORE INTO hub_sms_deleted_events (item_id, sync_status) VALUES (?1, 'pending')",
+        )?;
+        for item_id in item_ids {
+            stmt.execute([item_id])?;
+        }
+        Ok(())
+    }
+
+    pub fn unsynced_sms_deleted(&self, limit: i64) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT item_id FROM hub_sms_deleted_events WHERE sync_status != 'synced' ORDER BY created_at LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit], |row| row.get(0))?;
+        rows.collect()
+    }
+
+    pub fn mark_sms_deleted_synced(&self, item_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE hub_sms_deleted_events SET sync_status = 'synced' WHERE item_id = ?1",
+            [item_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_sms_ids_by_phone(&self, phone: &str) -> Result<Vec<i64>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT id FROM sms_messages WHERE phone_number = ?1")?;
+        let rows = stmt.query_map([phone], |r| r.get(0))?;
+        rows.collect()
+    }
+    pub fn enqueue_hub_event(&self, event: &HubEventRecord) -> Result<bool> {
+        Ok(self.conn.lock().unwrap().execute(
+            "INSERT OR IGNORE INTO hub_notification_events
+             (item_id,event_type,event_code,occurred_at,summary,details_json,local_fallback_applied)
+             VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                event.item_id,
+                event.event_type,
+                event.event_code,
+                event.occurred_at,
+                event.summary,
+                serde_json::to_string(&event.details).unwrap_or_else(|_| "{}".into()),
+                event.local_fallback_applied,
+            ],
+        )? > 0)
+    }
+
+    pub fn unsynced_hub_events(&self, limit: i64) -> Result<Vec<HubEventRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT item_id,event_type,event_code,occurred_at,summary,details_json,local_fallback_applied
+             FROM hub_notification_events WHERE sync_status!='synced' ORDER BY created_at LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit], |row| {
+            let details: String = row.get(5)?;
+            Ok(HubEventRecord {
+                item_id: row.get(0)?,
+                event_type: row.get(1)?,
+                event_code: row.get(2)?,
+                occurred_at: row.get(3)?,
+                summary: row.get(4)?,
+                details: serde_json::from_str(&details).unwrap_or_default(),
+                local_fallback_applied: row.get(6)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn mark_hub_event_synced(&self, item_id: &str) -> Result<usize> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE hub_notification_events SET sync_status='synced' WHERE item_id=?1",
+            [item_id],
+        )
+    }
+
+    pub fn mark_hub_event_local_fallback(&self, item_id: &str) -> Result<usize> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE hub_notification_events SET local_fallback_applied=1 WHERE item_id=?1
+             AND local_fallback_applied=0",
+            [item_id],
+        )
+    }
+
+    pub fn hub_event(&self, item_id: &str) -> Result<Option<HubEventRecord>> {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT item_id,event_type,event_code,occurred_at,summary,details_json,local_fallback_applied
+                 FROM hub_notification_events WHERE item_id=?1",
+                [item_id],
+                |row| {
+                    let details: String = row.get(5)?;
+                    Ok(HubEventRecord {
+                        item_id: row.get(0)?,
+                        event_type: row.get(1)?,
+                        event_code: row.get(2)?,
+                        occurred_at: row.get(3)?,
+                        summary: row.get(4)?,
+                        details: serde_json::from_str(&details).unwrap_or_default(),
+                        local_fallback_applied: row.get(6)?,
+                    })
+                },
+            )
+            .optional()
+    }
+
+    pub fn hub_events_due_for_local_fallback(
+        &self,
+        timeout_seconds: u64,
+        limit: i64,
+    ) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT item_id FROM hub_notification_events
+             WHERE sync_status!='synced' AND local_fallback_applied=0
+               AND created_at <= datetime('now', printf('-%d seconds', ?1))
+             ORDER BY created_at LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![timeout_seconds, limit], |row| row.get(0))?;
+        rows.collect()
+    }
+
     /// 获取与特定号码的对话历史
     pub fn get_sms_conversation(&self, phone_number: &str, limit: i64) -> Result<Vec<SmsMessage>> {
         let conn = self.conn.lock().unwrap();
@@ -992,24 +1217,15 @@ impl Database {
         )
     }
 
-    pub fn get_notification_logs(
-        &self,
-        event_type: &str,
-        status: &str,
-        query: &str,
-        start_date: &str,
-        end_date: &str,
-        limit: i64,
-        offset: i64,
-    ) -> Result<NotificationLogsResponse> {
+    pub fn get_notification_logs(&self, query: LogQuery<'_>) -> Result<NotificationLogsResponse> {
         let conn = self.conn.lock().unwrap();
-        let limit = limit.clamp(1, 200);
-        let offset = offset.max(0);
-        let event_type = event_type.trim();
-        let status = status.trim();
-        let query = query.trim();
-        let start_at = notification_log_start_bound(start_date);
-        let end_at = notification_log_end_bound(end_date);
+        let limit = query.limit.clamp(1, 200);
+        let offset = query.offset.max(0);
+        let event_type = query.kind.trim();
+        let status = query.status.trim();
+        let search = query.search.trim();
+        let start_at = notification_log_start_bound(query.start_date);
+        let end_at = notification_log_end_bound(query.end_date);
 
         let total = conn.query_row(
             "SELECT COUNT(*) FROM notification_logs
@@ -1024,7 +1240,7 @@ impl Database {
                )
                AND (?4 = '' OR created_at >= ?4)
                AND (?5 = '' OR created_at <= ?5)",
-            params![event_type, status, query, start_at, end_at],
+            params![event_type, status, search, start_at, end_at],
             |row| row.get(0),
         )?;
 
@@ -1048,7 +1264,7 @@ impl Database {
         )?;
 
         let rows = stmt.query_map(
-            params![event_type, status, query, start_at, end_at, limit, offset],
+            params![event_type, status, search, start_at, end_at, limit, offset],
             |row| {
                 Ok(NotificationLogEntry {
                     id: row.get(0)?,
@@ -1572,6 +1788,18 @@ impl Database {
         Ok(None)
     }
 
+    pub fn get_latest_smsc(&self) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let result = conn
+            .query_row(
+                "SELECT sms_center FROM smsc_cache WHERE sms_center != '' ORDER BY updated_at DESC LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(result)
+    }
+
     // ==================== Own number cache ====================
 
     pub fn upsert_own_number_cache(
@@ -1634,76 +1862,6 @@ impl Database {
                                 .collect(),
                             source: row.get(1)?,
                             updated_at: row.get(2)?,
-                        })
-                    },
-                )
-                .optional()?;
-            if entry.is_some() {
-                return Ok(entry);
-            }
-        }
-        Ok(None)
-    }
-
-    // ==================== SMS storage cache ====================
-
-    pub fn upsert_sms_storage_cache(
-        &self,
-        identity_key: &str,
-        iccid: &str,
-        imsi: &str,
-        operator_id: &str,
-        sms_used: Option<u32>,
-        sms_total: Option<u32>,
-        source: &str,
-    ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        let updated_at = Utc::now().to_rfc3339();
-        conn.execute(
-            "INSERT INTO sms_storage_cache (
-                identity_key, iccid, imsi, operator_id, sms_used, sms_total, source, updated_at
-             )
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-             ON CONFLICT(identity_key) DO UPDATE SET
-                iccid = excluded.iccid,
-                imsi = excluded.imsi,
-                operator_id = excluded.operator_id,
-                sms_used = excluded.sms_used,
-                sms_total = COALESCE(excluded.sms_total, sms_storage_cache.sms_total),
-                source = excluded.source,
-                updated_at = excluded.updated_at",
-            params![
-                identity_key,
-                iccid,
-                imsi,
-                operator_id,
-                sms_used,
-                sms_total,
-                source,
-                updated_at
-            ],
-        )?;
-        Ok(())
-    }
-
-    pub fn get_sms_storage_cache(
-        &self,
-        identity_keys: &[String],
-    ) -> Result<Option<SmsStorageCacheEntry>> {
-        let conn = self.conn.lock().unwrap();
-        for key in identity_keys {
-            let entry = conn
-                .query_row(
-                    "SELECT sms_used, sms_total, source, updated_at
-                     FROM sms_storage_cache
-                     WHERE identity_key = ?1",
-                    params![key],
-                    |row| {
-                        Ok(SmsStorageCacheEntry {
-                            sms_used: row.get(0)?,
-                            sms_total: row.get(1)?,
-                            source: row.get(2)?,
-                            updated_at: row.get(3)?,
                         })
                     },
                 )
@@ -2111,25 +2269,16 @@ impl Database {
     }
 
     /// 获取自动化执行日志（分页与过滤）
-    pub fn get_automation_logs(
-        &self,
-        task_type: &str,
-        status: &str,
-        query: &str,
-        start_date: &str,
-        end_date: &str,
-        limit: i64,
-        offset: i64,
-    ) -> Result<AutomationLogsResponse> {
+    pub fn get_automation_logs(&self, query: LogQuery<'_>) -> Result<AutomationLogsResponse> {
         let conn = self.conn.lock().unwrap();
-        let limit = limit.clamp(1, 200);
-        let offset = offset.max(0);
-        let task_type = task_type.trim();
-        let status = status.trim();
-        let query = query.trim();
+        let limit = query.limit.clamp(1, 200);
+        let offset = query.offset.max(0);
+        let task_type = query.kind.trim();
+        let status = query.status.trim();
+        let search = query.search.trim();
 
-        let start_at = notification_log_start_bound(start_date);
-        let end_at = notification_log_end_bound(end_date);
+        let start_at = notification_log_start_bound(query.start_date);
+        let end_at = notification_log_end_bound(query.end_date);
 
         let total = conn.query_row(
             "SELECT COUNT(*) FROM automation_logs
@@ -2142,7 +2291,7 @@ impl Database {
                )
                AND (?4 = '' OR created_at >= ?4)
                AND (?5 = '' OR created_at <= ?5)",
-            params![task_type, status, query, start_at, end_at],
+            params![task_type, status, search, start_at, end_at],
             |row| row.get(0),
         )?;
 
@@ -2163,7 +2312,7 @@ impl Database {
         )?;
 
         let rows = stmt.query_map(
-            params![task_type, status, query, start_at, end_at, limit, offset],
+            params![task_type, status, search, start_at, end_at, limit, offset],
             |row| {
                 let mut detail: String = row.get(5)?;
                 if detail == "执行成功 (0)" || detail.starts_with("执行成功 (0)") {
@@ -2316,28 +2465,23 @@ mod tests {
     }
 
     #[test]
-    fn sms_storage_cache_allows_empty_result() {
+    fn reconnecting_to_a_new_hub_resets_all_sms_for_full_sync() {
         let db = test_db();
-
-        db.upsert_sms_storage_cache(
-            "iccid:TEST_ICCID_001",
-            "TEST_ICCID_001",
-            "001010",
-            "00101",
-            None,
-            None,
-            "empty",
-        )
-        .unwrap();
-
-        let entry = db
-            .get_sms_storage_cache(&["iccid:TEST_ICCID_001".to_string()])
-            .unwrap()
+        let id = db
+            .insert_sms_at(
+                "incoming",
+                "10010",
+                "history",
+                "2026-08-15 12:00:00",
+                "received",
+                None,
+            )
             .unwrap();
-        assert_eq!(entry.sms_used, None);
-        assert_eq!(entry.sms_total, None);
-        assert_eq!(entry.source, "empty");
-        assert!(!entry.updated_at.is_empty());
+        db.mark_sms_hub_synced(id).unwrap();
+        assert!(db.get_unsynced_sms_messages(10).unwrap().is_empty());
+
+        assert_eq!(db.reset_sms_hub_sync().unwrap(), 1);
+        assert_eq!(db.get_unsynced_sms_messages(10).unwrap()[0].id, id);
     }
 
     #[test]
@@ -2395,5 +2539,33 @@ mod tests {
 
         let latest = db.latest_esim_euicc_cache().unwrap().unwrap();
         assert_eq!(latest.cache_key, "eid:EID001");
+    }
+
+    #[test]
+    fn smsc_cache_returns_latest_smsc() {
+        let db = test_db();
+        assert_eq!(db.get_latest_smsc().unwrap(), None);
+
+        db.upsert_smsc_cache(
+            "iccid:89860000000000000001",
+            "89860000000000000001",
+            "460000",
+            "46000",
+            "+8613800100500",
+            "test",
+        )
+        .unwrap();
+        assert_eq!(db.get_latest_smsc().unwrap().as_deref(), Some("+8613800100500"));
+
+        db.upsert_smsc_cache(
+            "iccid:89860000000000000002",
+            "89860000000000000002",
+            "460001",
+            "46001",
+            "+8613800200500",
+            "test",
+        )
+        .unwrap();
+        assert_eq!(db.get_latest_smsc().unwrap().as_deref(), Some("+8613800200500"));
     }
 }

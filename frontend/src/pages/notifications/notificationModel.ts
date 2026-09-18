@@ -262,6 +262,7 @@ function normalizeRule(rule: NotificationRule): NotificationRule {
     title_template: typeof rule.title_template === 'string' && rule.title_template.trim()
       ? rule.title_template
       : DEFAULT_TITLE_TEMPLATES[rule.type],
+    custom_body: typeof rule.custom_body === 'string' ? rule.custom_body : '',
     device_status_items: Array.isArray(rule.device_status_items) ? rule.device_status_items : defaultDeviceStatusItems(),
     device_status_schedule: {
       mode: rule.device_status_schedule?.mode === 'interval' ? 'interval' : 'fixed',
@@ -326,13 +327,13 @@ export function statusColor(status: NotificationLogStatus): 'primary' | 'error' 
 export function defaultChannelConfig(type: NotificationChannelKey): Record<string, unknown> {
   switch (type) {
     case 'webhook':
-      return { url: '', secret: '', headers: {} }
+      return { url: '', http_method: 'POST', secret: '', headers: {} }
     case 'bark':
       return { server_url: 'https://api.day.app', device_key: '', group: '', sound: '', level: '', icon: '', auto_copy: true, save_history: true }
     case 'pushplus':
       return { token: '', topic: '', template: 'txt', channel: '', option: '', callback_url: '' }
     case 'wecom_app':
-      return { corp_id: '', agent_id: '', secret: '', to_user: '@all', to_party: '', to_tag: '', safe: false }
+      return { api_base_url: '', corp_id: '', agent_id: '', secret: '', to_user: '@all', to_party: '', to_tag: '', safe: false }
     case 'wecom_robot':
       return { webhook_url: '', key: '' }
     case 'dingtalk_robot':
@@ -342,7 +343,7 @@ export function defaultChannelConfig(type: NotificationChannelKey): Record<strin
     case 'feishu_robot':
       return { webhook_url: '', token: '', secret: '' }
     case 'telegram':
-      return { bot_token: '', chat_id: '', parse_mode: '', disable_web_page_preview: true }
+      return { api_base_url: '', bot_token: '', chat_id: '', parse_mode: '', disable_web_page_preview: true }
     case 'email':
       return {
         smtp_host: '',
@@ -430,6 +431,7 @@ export function createRule(type: NotificationEventType, channelIds: string[]): N
     device_status_sms_period: 'last_24h',
     title_template: DEFAULT_TITLE_TEMPLATES[type],
     template: DEFAULT_TEMPLATES[type],
+    custom_body: '',
     quiet_hours: [],
     ddns_failure_threshold: 1,
   }

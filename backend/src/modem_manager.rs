@@ -3,9 +3,12 @@
 use std::collections::HashMap;
 #[cfg(unix)]
 use std::fs;
+#[cfg(unix)]
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use simadmin_device_runtime::ModemContext;
 use tokio::process::Command;
 use tracing::{info, warn};
 use zbus::{
@@ -48,16 +51,14 @@ const MM_SIM: &str = "org.freedesktop.ModemManager1.Sim";
 const MM_SMS: &str = "org.freedesktop.ModemManager1.Sms";
 
 const MM_MODE_NONE: u32 = 0;
-const MM_MODE_2G: u32 = 1 << 1;
-const MM_MODE_3G: u32 = 1 << 2;
 const MM_MODE_4G: u32 = 1 << 3;
 const MM_MODE_5G: u32 = 1 << 4;
 const MM_MODE_ANY: u32 = u32::MAX;
 const MODEM_SCAN_THRESHOLD: u32 = 3;
 const MODEM_RESTART_THRESHOLD: u32 = 5;
 const MODEM_RECOVERY_COOLDOWN_SECS: u64 = 300;
-const MODEM_DISCOVERY_TIMEOUT_SECS: u64 = 5;
-const MODEM_DISCOVERY_FAILURE_CACHE_SECS: u64 = 30;
+const MODEM_DISCOVERY_TIMEOUT_SECS: u64 = 2;
+const MODEM_DISCOVERY_FAILURE_CACHE_SECS: u64 = 5;
 const OPERATOR_SCAN_REQUEST_TIMEOUT_SECS: u64 = 45;
 const OPERATOR_SCAN_CACHE_POLL_SECS: u64 = 20;
 const NETWORK_REGISTER_TIMEOUT_SECS: u64 = 45;
@@ -422,7 +423,7 @@ fn parse_crsm_fcp_record_length(output: &str) -> usize {
                 // inner[i+3] = data coding byte
                 // inner[i+4..i+6] = record length (big-endian u16)
                 let record_len = ((inner[i + 4] as usize) << 8) | (inner[i + 5] as usize);
-                if record_len >= 28 && record_len <= 256 {
+                if (28..=256).contains(&record_len) {
                     return record_len;
                 }
             }
@@ -546,9 +547,7 @@ fn normalize_phone_number(value: &str) -> String {
 
     let mut normalized = String::new();
     for ch in value.chars() {
-        if ch == '+' && normalized.is_empty() {
-            normalized.push(ch);
-        } else if ch.is_ascii_digit() {
+        if (ch == '+' && normalized.is_empty()) || ch.is_ascii_digit() {
             normalized.push(ch);
         }
     }
@@ -756,10 +755,6 @@ fn own_number_identity_key(identity: &SimIdentity) -> Option<String> {
     }
 }
 
-fn sms_storage_identity_key(identity: &SimIdentity) -> Option<String> {
-    own_number_identity_key(identity)
-}
-
 pub fn cache_smsc_for_identity(
     db: &Database,
     identity: &SimIdentity,
@@ -791,10 +786,23 @@ fn smsc_cache_entry_for_identity(
     db.get_smsc_cache(&keys).ok().flatten()
 }
 
-#[allow(dead_code)]
-fn cached_smsc_for_identity(db: &Database, identity: &SimIdentity) -> String {
+pub fn cached_smsc_for_identity(db: &Database, identity: &SimIdentity) -> String {
     smsc_cache_entry_for_identity(db, identity)
         .map(|entry| normalize_smsc(&entry.sms_center))
+        .unwrap_or_default()
+}
+
+pub fn cached_smsc_or_latest(db: &Database, identity: Option<&SimIdentity>) -> String {
+    if let Some(identity) = identity {
+        let cached = cached_smsc_for_identity(db, identity);
+        if !cached.is_empty() {
+            return cached;
+        }
+    }
+    db.get_latest_smsc()
+        .ok()
+        .flatten()
+        .map(|value| normalize_smsc(&value))
         .unwrap_or_default()
 }
 
@@ -822,48 +830,14 @@ fn own_number_cache_entry_for_identity(
     db: &Database,
     identity: &SimIdentity,
 ) -> Option<crate::db::OwnNumberCacheEntry> {
-    let Some(identity_key) = own_number_identity_key(identity) else {
-        return None;
-    };
+    let identity_key = own_number_identity_key(identity)?;
     db.get_own_number_cache(&[identity_key]).ok().flatten()
 }
 
-#[allow(dead_code)]
-fn cached_own_numbers_for_identity(db: &Database, identity: &SimIdentity) -> Vec<String> {
+pub fn cached_own_numbers_for_identity(db: &Database, identity: &SimIdentity) -> Vec<String> {
     own_number_cache_entry_for_identity(db, identity)
         .map(|entry| normalize_phone_numbers(entry.phone_numbers))
         .unwrap_or_default()
-}
-
-fn sms_storage_cache_entry_for_identity(
-    db: &Database,
-    identity: &SimIdentity,
-) -> Option<crate::db::SmsStorageCacheEntry> {
-    let Some(identity_key) = sms_storage_identity_key(identity) else {
-        return None;
-    };
-    db.get_sms_storage_cache(&[identity_key]).ok().flatten()
-}
-
-fn cache_sms_storage_for_identity(
-    db: &Database,
-    identity: &SimIdentity,
-    sms_used: Option<u32>,
-    sms_total: Option<u32>,
-    source: &str,
-) {
-    let Some(identity_key) = sms_storage_identity_key(identity) else {
-        return;
-    };
-    let _ = db.upsert_sms_storage_cache(
-        &identity_key,
-        &identity.iccid,
-        &identity.imsi,
-        &identity.operator_id,
-        sms_used,
-        sms_total,
-        source,
-    );
 }
 
 pub fn sim_details_cache_missing(db: &Database, identity: &SimIdentity) -> bool {
@@ -872,7 +846,6 @@ pub fn sim_details_cache_missing(db: &Database, identity: &SimIdentity) -> bool 
     }
     own_number_cache_entry_for_identity(db, identity).is_none()
         || smsc_cache_entry_for_identity(db, identity).is_none()
-        || sms_storage_cache_entry_for_identity(db, identity).is_none()
 }
 
 fn extract_mode_pairs(value: &OwnedValue) -> Vec<(u32, u32)> {
@@ -994,41 +967,6 @@ fn localize_operator_display(mcc: &str, mnc: &str, name: &str) -> String {
     name.to_string()
 }
 
-fn normalize_mode(allowed: u32, preferred: u32) -> String {
-    if allowed == MM_MODE_5G || (preferred == MM_MODE_5G && allowed & MM_MODE_4G == 0) {
-        return "nr".to_string();
-    }
-    if allowed == MM_MODE_4G || (preferred == MM_MODE_4G && allowed & MM_MODE_5G == 0) {
-        return "lte".to_string();
-    }
-    "auto".to_string()
-}
-
-fn supported_mode_labels(pairs: &[(u32, u32)]) -> Vec<String> {
-    let mut modes = Vec::new();
-
-    if pairs.iter().any(|(allowed, preferred)| {
-        *allowed == MM_MODE_4G || (*preferred == MM_MODE_4G && *allowed & MM_MODE_5G == 0)
-    }) {
-        modes.push("lte".to_string());
-    }
-    if pairs.iter().any(|(allowed, preferred)| {
-        *allowed == MM_MODE_5G || (*preferred == MM_MODE_5G && *allowed & MM_MODE_4G == 0)
-    }) {
-        modes.push("nr".to_string());
-    }
-    if pairs.iter().any(|(allowed, _)| {
-        (*allowed & (MM_MODE_2G | MM_MODE_3G | MM_MODE_4G | MM_MODE_5G) != 0)
-            || *allowed == MM_MODE_ANY
-    }) {
-        modes.insert(0, "auto".to_string());
-    }
-
-    modes.sort();
-    modes.dedup();
-    modes
-}
-
 fn choose_mode_pair(target: &RadioMode, supported: &[(u32, u32)]) -> Option<(u32, u32)> {
     match target {
         RadioMode::LteOnly => supported.iter().copied().find(|(allowed, preferred)| {
@@ -1134,13 +1072,15 @@ fn no_modem_error(detail: impl Into<String>) -> zbus::Error {
     zbus::fdo::Error::Failed(detail.into()).into()
 }
 
+fn shared_runtime_error(error: simadmin_device_runtime::RuntimeError) -> zbus::Error {
+    zbus::fdo::Error::Failed(error.to_string()).into()
+}
+
 fn recent_modem_discovery_failure() -> Option<String> {
     let Ok(guard) = MODEM_DISCOVERY_FAILURE.lock() else {
         return None;
     };
-    let Some((recorded_at, detail)) = guard.as_ref() else {
-        return None;
-    };
+    let (recorded_at, detail) = guard.as_ref()?;
     (recorded_at.elapsed() < Duration::from_secs(MODEM_DISCOVERY_FAILURE_CACHE_SECS))
         .then(|| detail.clone())
 }
@@ -1336,31 +1276,11 @@ fn mm_access_tech_to_string(tech: u32) -> String {
 
 pub async fn get_device_info_data(conn: &Connection) -> zbus::Result<DeviceInfoResponse> {
     let modem_path = find_modem_path(conn).await?;
-    let modem_props = get_all_properties(conn, &modem_path, MM_MODEM).await?;
-
-    let manufacturer = modem_props
-        .get("Manufacturer")
-        .map(extract_string)
-        .unwrap_or_default();
-    let model = modem_props
-        .get("Model")
-        .map(extract_string)
-        .unwrap_or_default();
-    let revision = modem_props.get("Revision").map(extract_string);
-    let state = modem_props.get("State").map(extract_i32).unwrap_or(0);
-    let imei = match get_property(conn, &modem_path, MM_MODEM_3GPP, "Imei").await {
-        Ok(value) => extract_string(&value),
-        Err(_) => String::new(),
-    };
-
-    Ok(DeviceInfoResponse {
-        imei,
-        manufacturer,
-        model,
-        revision,
-        online: state >= 6,
-        powered: state >= 3,
-    })
+    ModemContext::new(conn, &modem_path)
+        .map_err(shared_runtime_error)?
+        .device_info()
+        .await
+        .map_err(shared_runtime_error)
 }
 
 #[allow(dead_code)]
@@ -1869,23 +1789,6 @@ async fn refresh_sim_details_background_inner(conn: &Connection, db: &Database, 
         }
         cache_smsc_for_identity(db, &identity, &sms_center, source);
     }
-
-    if force || sms_storage_cache_entry_for_identity(db, &identity).is_none() {
-        let mut storage = None;
-        if let Some(path) = modem_path.as_deref() {
-            if let Ok(output) = send_at_via_modem_command(conn, path, "AT+CPMS?").await {
-                storage = parse_sms_storage_info(&output);
-            }
-        }
-        match storage {
-            Some((used, total)) => {
-                cache_sms_storage_for_identity(db, &identity, Some(used), Some(total), "cpms");
-            }
-            None => {
-                cache_sms_storage_for_identity(db, &identity, None, None, "empty");
-            }
-        }
-    }
 }
 
 async fn modem_command_smsc_fallback(conn: &Connection, modem_path: &str) -> String {
@@ -1943,96 +1846,36 @@ async fn active_protocol_smsc_fallback(conn: &Connection, modem_path: &str) -> S
     .unwrap_or_default()
 }
 
-fn parse_sms_storage_info(at_output: &str) -> Option<(u32, u32)> {
-    if let Some(pos) = at_output.find("+CPMS:") {
-        let line = &at_output[pos + 6..];
-        let parts: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
-        for chunk in parts.chunks(3) {
-            if chunk.len() >= 3 {
-                let mem = chunk[0].trim_matches('"').trim_matches('\'');
-                if mem == "SM" {
-                    let used_clean: String = chunk[1]
-                        .trim_matches('"')
-                        .trim_matches('\'')
-                        .chars()
-                        .take_while(|c| c.is_ascii_digit())
-                        .collect();
-                    let total_clean: String = chunk[2]
-                        .trim_matches('"')
-                        .trim_matches('\'')
-                        .chars()
-                        .take_while(|c| c.is_ascii_digit())
-                        .collect();
-                    let used = used_clean.parse::<u32>().ok();
-                    let total = total_clean.parse::<u32>().ok();
-                    if let (Some(u), Some(t)) = (used, total) {
-                        return Some((u, t));
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
 pub async fn get_sim_info_data_with_cache(
     conn: &Connection,
     db: Option<&Database>,
 ) -> zbus::Result<SimInfoResponse> {
     let modem_path = find_modem_path(conn).await?;
-    let modem_props = get_all_properties(conn, &modem_path, MM_MODEM).await?;
-    let gpp_props = get_all_properties(conn, &modem_path, MM_MODEM_3GPP).await?;
-    let sim_path = get_sim_path(conn, &modem_path).await?;
-
-    if sim_path.is_empty() || sim_path == "/" {
-        return Ok(SimInfoResponse {
-            present: false,
-            ..Default::default()
-        });
+    let mut data = ModemContext::new(conn, &modem_path)
+        .map_err(shared_runtime_error)?
+        .sim_info()
+        .await
+        .map_err(shared_runtime_error)?;
+    if !data.present {
+        return Ok(data);
     }
-
-    let sim_props = get_all_properties(conn, &sim_path, MM_SIM).await?;
-    let iccid = crate::utils::normalize_iccid(
-        &sim_props
-            .get("SimIdentifier")
-            .map(extract_string)
-            .unwrap_or_default(),
-    );
-    let imsi = sim_props
-        .get("Imsi")
-        .map(extract_string)
-        .unwrap_or_default();
-
-    let mut operator_id = sim_props
-        .get("OperatorIdentifier")
-        .map(extract_string)
-        .unwrap_or_default();
-    if operator_id.is_empty() {
-        operator_id = operator_code_from_imsi(&imsi);
+    let mut operator_id = String::new();
+    if !data.mcc.is_empty() && !data.mnc.is_empty() {
+        operator_id = format!("{}{}", data.mcc, data.mnc);
     }
     if operator_id.is_empty() {
-        operator_id = gpp_props
-            .get("OperatorCode")
-            .map(extract_string)
-            .unwrap_or_default();
+        operator_id = data.registered_operator_code.clone();
     }
     let identity = SimIdentity {
-        iccid: iccid.clone(),
-        imsi: imsi.clone(),
-        operator_id: operator_id.clone(),
+        iccid: data.iccid.clone(),
+        imsi: data.imsi.clone(),
+        operator_id,
     };
-    let (mcc, mnc) = split_operator_code(&operator_id);
 
     let mut phone_number_is_manual = false;
     let mut sms_center_is_manual = false;
 
-    let mut phone_numbers = extract_own_numbers_property(&sim_props);
-    if phone_numbers.is_empty() {
-        phone_numbers = extract_own_numbers_property(&modem_props);
-    }
-    if phone_numbers.is_empty() {
-        phone_numbers = extract_own_numbers_property(&gpp_props);
-    }
+    let mut phone_numbers = std::mem::take(&mut data.phone_numbers);
     if !phone_numbers.is_empty() {
         if let Some(db) = db {
             cache_own_numbers_for_identity(db, &identity, &phone_numbers, "dbus");
@@ -2051,7 +1894,7 @@ pub async fn get_sim_info_data_with_cache(
     phone_numbers.sort();
     phone_numbers.dedup();
 
-    let mut sms_center = extract_smsc_property(&sim_props);
+    let mut sms_center = std::mem::take(&mut data.sms_center);
     if !sms_center.is_empty() {
         if let Some(db) = db {
             cache_smsc_for_identity(db, &identity, &sms_center, "dbus");
@@ -2068,160 +1911,26 @@ pub async fn get_sim_info_data_with_cache(
         }
     }
 
-    // --- 新增诊断属性提取 ---
-    let sim_type_u = sim_props.get("SimType").map(extract_u32).unwrap_or(0);
-    let sim_type = match sim_type_u {
-        1 => "physical".to_string(),
-        2 => "esim".to_string(),
-        _ => "unknown".to_string(),
-    };
-
-    let esim_status_u = sim_props.get("EsimStatus").map(extract_u32).unwrap_or(0);
-    let esim_status = match esim_status_u {
-        1 => "none".to_string(),
-        2 => "no-profiles".to_string(),
-        3 => "with-profiles".to_string(),
-        _ => "unknown".to_string(),
-    };
-
-    let active = sim_props.get("Active").map(extract_bool).unwrap_or(false);
-    let operator_name = sim_props
-        .get("OperatorName")
-        .map(extract_string)
-        .unwrap_or_default();
-
-    let registered_operator_name = gpp_props
-        .get("OperatorName")
-        .map(extract_string)
-        .unwrap_or_default();
-    let registered_operator_code = gpp_props
-        .get("OperatorCode")
-        .map(extract_string)
-        .unwrap_or_default();
-
-    let lock_status_u = modem_props
-        .get("UnlockRequired")
-        .map(extract_u32)
-        .unwrap_or(0);
-    let lock_status = match lock_status_u {
-        1 => "none".to_string(),
-        2 => "sim-pin".to_string(),
-        3 => "sim-pin2".to_string(),
-        4 => "sim-puk".to_string(),
-        5 => "sim-puk2".to_string(),
-        _ => "unknown".to_string(),
-    };
-
-    let unlock_retries = modem_props
-        .get("UnlockRetries")
-        .and_then(|val| HashMap::<u32, u32>::try_from(val.clone()).ok())
-        .unwrap_or_default();
-    let pin1_retries = unlock_retries.get(&2).cloned();
-    let pin2_retries = unlock_retries.get(&3).cloned();
-    let puk1_retries = unlock_retries.get(&4).cloned();
-    let puk2_retries = unlock_retries.get(&5).cloned();
-
-    let carrier_config = modem_props
-        .get("CarrierConfiguration")
-        .map(extract_string)
-        .unwrap_or_default();
-    let carrier_config_revision = modem_props
-        .get("CarrierConfigurationRevision")
-        .map(extract_string)
-        .unwrap_or_default();
-
-    let mut sms_used = None;
-    let mut sms_total = None;
-    if let Some(db) = db {
-        if let Some(entry) = sms_storage_cache_entry_for_identity(db, &identity) {
-            sms_used = entry.sms_used;
-            sms_total = entry.sms_total;
-        }
-    }
-
-    Ok(SimInfoResponse {
-        present: true,
-        iccid,
-        imsi,
-        phone_numbers,
-        sms_center,
-        mcc,
-        mnc,
-        phone_number_is_manual,
-        sms_center_is_manual,
-        sim_path,
-        modem_path,
-        sim_type,
-        esim_status,
-        active,
-        operator_name,
-        registered_operator_name,
-        registered_operator_code,
-        lock_status,
-        pin1_retries,
-        puk1_retries,
-        pin2_retries,
-        puk2_retries,
-        carrier_config,
-        carrier_config_revision,
-        sms_used,
-        sms_total,
-    })
+    data.phone_numbers = phone_numbers;
+    data.sms_center = sms_center;
+    data.phone_number_is_manual = phone_number_is_manual;
+    data.sms_center_is_manual = sms_center_is_manual;
+    Ok(data)
 }
 
 pub async fn get_network_info_data(conn: &Connection) -> zbus::Result<NetworkInfoResponse> {
     let modem_path = find_modem_path(conn).await?;
-    let modem_props = get_all_properties(conn, &modem_path, MM_MODEM).await?;
-    let gpp_props = get_all_properties(conn, &modem_path, MM_MODEM_3GPP).await?;
-
-    let operator_code = gpp_props
-        .get("OperatorCode")
-        .map(extract_string)
-        .unwrap_or_default();
-    let (mcc, mnc) = if operator_code.len() >= 5 {
-        (
-            Some(operator_code[..3].to_string()),
-            Some(operator_code[3..].to_string()),
-        )
-    } else {
-        (None, None)
-    };
-
-    let signal_strength = modem_props
-        .get("SignalQuality")
-        .and_then(|value| {
-            <(u32, bool)>::try_from(value.clone())
-                .ok()
-                .map(|(q, _)| q as u8)
-        })
-        .unwrap_or(0);
-
-    let op_raw = gpp_props
-        .get("OperatorName")
-        .map(extract_string)
-        .unwrap_or_default();
-    let mcc_s = mcc.clone().unwrap_or_default();
-    let mnc_s = mnc.clone().unwrap_or_default();
-
-    Ok(NetworkInfoResponse {
-        operator_name: localize_operator_display(&mcc_s, &mnc_s, &op_raw),
-        registration_status: mm_registration_to_string(
-            gpp_props
-                .get("RegistrationState")
-                .map(extract_u32)
-                .unwrap_or(0),
-        )
-        .to_string(),
-        technology_preference: mm_access_tech_to_string(
-            modem_props
-                .get("AccessTechnologies")
-                .map(extract_u32)
-                .unwrap_or(0),
-        ),
-        signal_strength,
-        mcc,
-        mnc,
-    })
+    let mut data = ModemContext::new(conn, &modem_path)
+        .map_err(shared_runtime_error)?
+        .network_info()
+        .await
+        .map_err(shared_runtime_error)?;
+    data.operator_name = localize_operator_display(
+        data.mcc.as_deref().unwrap_or_default(),
+        data.mnc.as_deref().unwrap_or_default(),
+        &data.operator_name,
+    );
+    Ok(data)
 }
 
 fn is_get_cellinfo_unsupported(err: &zbus::Error) -> bool {
@@ -2725,18 +2434,6 @@ LTE Timing Advance: 'unavailable'"#;
     }
 
     #[test]
-    fn parses_sms_storage_info_correctly() {
-        let output_1 = "+CPMS: \"SM\",2,30,\"ME\",5,50,\"SM\",2,30";
-        assert_eq!(parse_sms_storage_info(output_1), Some((2, 30)));
-
-        let output_2 = "+CPMS: \"ME\",5,50,\"SM\",10,30\n\rOK";
-        assert_eq!(parse_sms_storage_info(output_2), Some((10, 30)));
-
-        let output_invalid = "+CPMS: \"ME\",5,50";
-        assert_eq!(parse_sms_storage_info(output_invalid), None);
-    }
-
-    #[test]
     fn extracts_smsc_from_protocol_output() {
         let output = "SMSC Address\n  Type: 'international'\n  Number: '+10001'";
 
@@ -2834,6 +2531,48 @@ LTE Timing Advance: 'unavailable'"#;
     }
 
     #[test]
+    fn cached_smsc_or_latest_falls_back_to_latest_history() {
+        let db = crate::db::Database::new(std::path::PathBuf::from(":memory:")).unwrap();
+        let identity = SimIdentity {
+            iccid: "TEST_ICCID_CURRENT".to_string(),
+            imsi: "460000".to_string(),
+            operator_id: "46000".to_string(),
+        };
+
+        // Initially no cache
+        assert_eq!(cached_smsc_or_latest(&db, Some(&identity)), "");
+
+        // Suppose another SIM had an SMSC recorded in the smsc_cache table
+        db.upsert_smsc_cache(
+            "iccid:TEST_ICCID_OLD",
+            "TEST_ICCID_OLD",
+            "460000",
+            "46000",
+            "+8613800100500",
+            "test",
+        )
+        .unwrap();
+
+        // Current SIM does not match, but should fall back to latest historical SMSC
+        assert_eq!(cached_smsc_or_latest(&db, Some(&identity)), "+8613800100500");
+
+        // When identity is None, should also fall back to latest
+        assert_eq!(cached_smsc_or_latest(&db, None), "+8613800100500");
+
+        // When current SIM has its own SMSC, it takes precedence
+        db.upsert_smsc_cache(
+            "iccid:TEST_ICCID_CURRENT",
+            "TEST_ICCID_CURRENT",
+            "460000",
+            "46000",
+            "+8613800200500",
+            "test",
+        )
+        .unwrap();
+        assert_eq!(cached_smsc_or_latest(&db, Some(&identity)), "+8613800200500");
+    }
+
+    #[test]
     fn empty_sim_detail_cache_counts_as_present_until_iccid_changes() {
         let db = crate::db::Database::new(std::path::PathBuf::from(":memory:")).unwrap();
         let identity = SimIdentity {
@@ -2845,7 +2584,7 @@ LTE Timing Advance: 'unavailable'"#;
 
         cache_own_numbers_for_identity(&db, &identity, &[], "empty");
         cache_smsc_for_identity(&db, &identity, "", "empty");
-        cache_sms_storage_for_identity(&db, &identity, None, None, "empty");
+
         assert!(!sim_details_cache_missing(&db, &identity));
 
         let changed_identity = SimIdentity {
@@ -3039,6 +2778,66 @@ LTE Timing Advance: 'unavailable'"#;
             vec!["LTE B8".to_string(), "NR n78".to_string()]
         );
     }
+
+    fn apn_ctx(
+        path: &str,
+        context_type: &str,
+        apn: &str,
+        protocol: &str,
+        active: bool,
+    ) -> ApnContext {
+        ApnContext {
+            path: path.to_string(),
+            name: path.rsplit('/').next().unwrap_or("bearer").to_string(),
+            active,
+            apn: apn.to_string(),
+            protocol: protocol.to_string(),
+            username: String::new(),
+            password: String::new(),
+            auth_method: "chap".to_string(),
+            context_type: context_type.to_string(),
+        }
+    }
+
+    #[test]
+    fn dedups_stale_data_bearers_keeps_attach() {
+        let contexts = vec![
+            apn_ctx("/mm/Bearer/0", APN_CONTEXT_TYPE_ATTACH, "MORE", "ip", true),
+            apn_ctx("/mm/Bearer/1", "internet", "more", "dual", false),
+            apn_ctx("/mm/Bearer/2", "internet", "more", "dual", false),
+        ];
+
+        let deduped = dedup_apn_contexts(contexts);
+
+        assert_eq!(deduped.len(), 2);
+        assert_eq!(deduped[0].context_type, APN_CONTEXT_TYPE_ATTACH);
+        // 两个重复的数据承载仅保留最新的
+        assert_eq!(deduped[1].path, "/mm/Bearer/2");
+    }
+
+    #[test]
+    fn dedups_data_bearers_prefers_connected() {
+        let contexts = vec![
+            apn_ctx("/mm/Bearer/1", "internet", "more", "dual", true),
+            apn_ctx("/mm/Bearer/2", "internet", "more", "dual", false),
+        ];
+
+        let deduped = dedup_apn_contexts(contexts);
+
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].path, "/mm/Bearer/1");
+        assert!(deduped[0].active);
+    }
+
+    #[test]
+    fn keeps_distinct_apn_contexts() {
+        let contexts = vec![
+            apn_ctx("/mm/Bearer/1", "internet", "more", "dual", false),
+            apn_ctx("/mm/Bearer/2", "internet", "ims", "dual", false),
+        ];
+
+        assert_eq!(dedup_apn_contexts(contexts).len(), 2);
+    }
 }
 
 fn parse_mmcli_colon_value(line: &str) -> Option<(String, String)> {
@@ -3219,8 +3018,8 @@ pub async fn get_cells_data(conn: &Connection) -> zbus::Result<CellsResponse> {
         if is_serving {
             serving_cell = ServingCell {
                 tech: tech.clone(),
-                cell_id: parse_hex_u32(&cell_id_hex.trim_start_matches("0x")),
-                tac: parse_hex_u32(&tac_hex.trim_start_matches("0x")),
+                cell_id: parse_hex_u32(cell_id_hex.trim_start_matches("0x")),
+                tac: parse_hex_u32(tac_hex.trim_start_matches("0x")),
             };
         }
 
@@ -3256,7 +3055,7 @@ pub async fn get_cells_data(conn: &Connection) -> zbus::Result<CellsResponse> {
             tech.to_uppercase()
         };
 
-        let cell_id_u = parse_hex_u32(&cell_id_hex.trim_start_matches("0x"));
+        let cell_id_u = parse_hex_u32(cell_id_hex.trim_start_matches("0x"));
         parsed_cells.push(CellInfo {
             is_serving,
             band: single_current_band_label(&current_bands, &tech).unwrap_or_default(),
@@ -3296,24 +3095,11 @@ pub async fn get_cells_data(conn: &Connection) -> zbus::Result<CellsResponse> {
 
 pub async fn get_radio_mode(conn: &Connection) -> zbus::Result<RadioModeResponse> {
     let modem_path = find_modem_path(conn).await?;
-    let current_modes = get_property(conn, &modem_path, MM_MODEM, "CurrentModes").await?;
-    let supported_modes = get_property(conn, &modem_path, MM_MODEM, "SupportedModes").await?;
-    let (allowed, preferred) =
-        <(u32, u32)>::try_from(current_modes).unwrap_or((MM_MODE_NONE, MM_MODE_NONE));
-    let supported = extract_mode_pairs(&supported_modes);
-    let technology_preference = mm_access_tech_to_string(
-        get_all_properties(conn, &modem_path, MM_MODEM)
-            .await?
-            .get("AccessTechnologies")
-            .map(extract_u32)
-            .unwrap_or(0),
-    );
-
-    Ok(RadioModeResponse {
-        mode: normalize_mode(allowed, preferred),
-        technology_preference,
-        supported_modes: supported_mode_labels(&supported),
-    })
+    ModemContext::new(conn, &modem_path)
+        .map_err(shared_runtime_error)?
+        .radio_mode()
+        .await
+        .map_err(shared_runtime_error)
 }
 
 pub async fn set_radio_mode(conn: &Connection, mode: RadioMode) -> zbus::Result<()> {
@@ -3797,8 +3583,12 @@ async fn set_data_connection_inner(
 
 pub async fn get_data_connection_status(conn: &Connection) -> zbus::Result<bool> {
     let modem_path = find_modem_path(conn).await?;
-    let modem_props = get_all_properties(conn, &modem_path, MM_MODEM).await?;
-    Ok(modem_props.get("State").map(extract_i32).unwrap_or(0) >= MM_MODEM_STATE_CONNECTED)
+    Ok(ModemContext::new(conn, &modem_path)
+        .map_err(shared_runtime_error)?
+        .data_connection()
+        .await
+        .map_err(shared_runtime_error)?
+        .active)
 }
 
 #[allow(dead_code)]
@@ -3854,7 +3644,7 @@ pub async fn apply_roaming_policy(
 ) -> zbus::Result<()> {
     config
         .set_roaming_allowed(allowed)
-        .map_err(|e| zbus::fdo::Error::Failed(e))?;
+        .map_err(zbus::fdo::Error::Failed)?;
     if get_data_connection_status(conn).await.unwrap_or(false) {
         let apn_config = config.get_apn_config();
         set_data_connection_with_apn(conn, false, allowed, Some(&apn_config)).await?;
@@ -4154,16 +3944,11 @@ pub async fn set_airplane_mode(conn: &Connection, enabled: bool) -> Result<(), S
 
 pub async fn get_airplane_mode(conn: &Connection) -> zbus::Result<AirplaneModeResponse> {
     let modem_path = find_modem_path(conn).await?;
-    let modem_props = get_all_properties(conn, &modem_path, MM_MODEM).await?;
-    let state = modem_props.get("State").map(extract_i32).unwrap_or(0);
-    let powered = state >= 3;
-    let online = state >= 6;
-
-    Ok(AirplaneModeResponse {
-        enabled: matches!(state, 3 | 4),
-        powered,
-        online,
-    })
+    ModemContext::new(conn, &modem_path)
+        .map_err(shared_runtime_error)?
+        .airplane_mode()
+        .await
+        .map_err(shared_runtime_error)
 }
 
 pub async fn get_signal_strength(conn: &Connection) -> zbus::Result<SignalStrengthResponse> {
@@ -4470,6 +4255,9 @@ const MM_BEARER: &str = "org.freedesktop.ModemManager1.Bearer";
 const MM_BEARER_ALLOWED_AUTH_NONE: u32 = 1 << 0;
 const MM_BEARER_ALLOWED_AUTH_PAP: u32 = 1 << 1;
 const MM_BEARER_ALLOWED_AUTH_CHAP: u32 = 1 << 2;
+/// MMBearerType: LTE 初始附着承载（default-attach）
+const MM_BEARER_TYPE_DEFAULT_ATTACH: u32 = 2;
+const APN_CONTEXT_TYPE_ATTACH: &str = "attach";
 
 fn bearer_ip_type_to_protocol(v: u32) -> &'static str {
     match v {
@@ -4544,7 +4332,13 @@ pub async fn list_apn_contexts(
             .map(mm_allowed_auth_to_apn_auth_method)
             .unwrap_or("chap");
         let connected = props.get("Connected").map(extract_bool).unwrap_or(false);
-        let name = path.rsplit('/').next().unwrap_or("bearer").to_string();
+        let bearer_type = props.get("Type").map(extract_u32).unwrap_or(0);
+        let is_attach = bearer_type == MM_BEARER_TYPE_DEFAULT_ATTACH;
+        let name = if is_attach {
+            "attach".to_string()
+        } else {
+            path.rsplit('/').next().unwrap_or("bearer").to_string()
+        };
         contexts.push(ApnContext {
             path: path.clone(),
             name,
@@ -4554,7 +4348,11 @@ pub async fn list_apn_contexts(
             username: user,
             password,
             auth_method: auth_method.into(),
-            context_type: "internet".into(),
+            context_type: if is_attach {
+                APN_CONTEXT_TYPE_ATTACH.into()
+            } else {
+                "internet".into()
+            },
         });
     }
     if let Some(config) = configured_apn.filter(|config| !config.apn.trim().is_empty()) {
@@ -4568,6 +4366,7 @@ pub async fn list_apn_contexts(
             }
         }
     }
+    let mut contexts = dedup_apn_contexts(contexts);
     if contexts.is_empty() {
         let mut fallback = configured_apn
             .map(apn_config_to_simple_connect_settings)
@@ -4602,6 +4401,31 @@ pub async fn list_apn_contexts(
         });
     }
     Ok(ApnListResponse { contexts })
+}
+
+/// 去重 APN 上下文：每次拨号会在 ModemManager 中新建 bearer，旧的断开 bearer
+/// 不会被回收，导致同一 APN/协议出现多个重复条目。同键仅保留一个：
+/// 优先已连接者，否则保留最新出现的。附着承载（attach）单独展示，不参与去重。
+fn dedup_apn_contexts(contexts: Vec<ApnContext>) -> Vec<ApnContext> {
+    let mut result: Vec<ApnContext> = Vec::new();
+    for ctx in contexts {
+        if ctx.context_type == APN_CONTEXT_TYPE_ATTACH {
+            result.push(ctx);
+            continue;
+        }
+        let key = (ctx.apn.trim().to_ascii_lowercase(), ctx.protocol.clone());
+        if let Some(existing) = result.iter_mut().find(|c| {
+            c.context_type != APN_CONTEXT_TYPE_ATTACH
+                && (c.apn.trim().to_ascii_lowercase(), c.protocol.clone()) == key
+        }) {
+            if !existing.active {
+                *existing = ctx;
+            }
+        } else {
+            result.push(ctx);
+        }
+    }
+    result
 }
 
 fn extract_object_path_array(value: &OwnedValue) -> Vec<String> {
@@ -4809,38 +4633,7 @@ pub async fn get_bearer_stats_by_interface(
     Ok(stats_by_interface)
 }
 
-/// 遍历所有 modem 及其 bearers，查找与指定 interface 匹配的 bearer 并获取其流量 Stats
-pub async fn get_bearer_stats_for_interface(
-    conn: &Connection,
-    interface_name: &str,
-) -> zbus::Result<Option<BearerTrafficStats>> {
-    let modem_paths = match list_modem_paths(conn).await {
-        Ok(paths) => paths,
-        Err(_) => return Ok(None),
-    };
-
-    for modem_path in modem_paths {
-        for bearer_path in bearer_paths_for_modem(conn, &modem_path).await {
-            let bearer_props = match get_all_properties(conn, &bearer_path, MM_BEARER).await {
-                Ok(props) => props,
-                Err(_) => continue,
-            };
-
-            if bearer_interface_names(&bearer_props)
-                .iter()
-                .any(|name| name == interface_name)
-            {
-                return Ok(merge_stats(
-                    extract_bearer_stats(&bearer_props),
-                    qmi_packet_stats_for_modem(conn, &modem_path).await,
-                ));
-            }
-        }
-    }
-
-    Ok(None)
-}
-
+/// Updates APN properties on an existing ModemManager bearer.
 pub async fn set_apn_on_bearer(conn: &Connection, req: &SetApnRequest) -> zbus::Result<()> {
     with_serial(async {
         let props_proxy =
@@ -5013,7 +4806,7 @@ pub async fn hangup_call(conn: &Connection, call_path: &str) -> zbus::Result<()>
     if is_at_call_path(call_path) {
         run_direct_at_command(conn, "ATH")
             .await
-            .map_err(|err| zbus::fdo::Error::Failed(err))?;
+            .map_err(zbus::fdo::Error::Failed)?;
         return Ok(());
     }
     terminate_call(conn, call_path).await
@@ -5407,7 +5200,7 @@ pub async fn hangup_all_calls(conn: &Connection) -> zbus::Result<()> {
         {
             run_direct_at_command(conn, "ATH")
                 .await
-                .map_err(|err| zbus::fdo::Error::Failed(err))?;
+                .map_err(zbus::fdo::Error::Failed)?;
             return Ok(());
         }
         let modem_path = find_modem_path(conn).await?;
@@ -5426,7 +5219,7 @@ pub async fn answer_call(conn: &Connection, call_path: &str) -> zbus::Result<()>
         if is_at_call_path(call_path) {
             run_direct_at_command(conn, "ATA")
                 .await
-                .map_err(|err| zbus::fdo::Error::Failed(err))?;
+                .map_err(zbus::fdo::Error::Failed)?;
             return Ok(());
         }
         let call_proxy = Proxy::new(conn, MM_SERVICE, call_path, MM_CALL).await?;
@@ -5510,15 +5303,13 @@ pub async fn send_sms(
 ) -> zbus::Result<String> {
     with_serial(async {
         let modem_path = find_modem_path(conn).await?;
-        let proxy = Proxy::new(conn, MM_SERVICE, modem_path.as_str(), MM_MESSAGING).await?;
-
-        let mut sms_props: HashMap<String, Value<'_>> = HashMap::new();
-        sms_props.insert("number".to_string(), Value::new(phone_number));
-        sms_props.insert("text".to_string(), Value::new(content));
-
-        let sms_path: OwnedObjectPath = proxy.call("Create", &(sms_props,)).await?;
-        let sms_proxy = Proxy::new(conn, MM_SERVICE, &sms_path, MM_SMS).await?;
-        sms_proxy.call::<_, _, ()>("Send", &()).await?;
+        let sms_path = ModemContext::new(conn, &modem_path)
+            .map_err(shared_runtime_error)?
+            .send_sms(phone_number, content)
+            .await
+            .map_err(shared_runtime_error)?;
+        let sms_path = OwnedObjectPath::try_from(sms_path.as_str())
+            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
 
         info!(path = %sms_path, "SMS sent successfully");
         schedule_sent_sms_delete(conn, modem_path.as_str(), sms_path.clone());
@@ -6038,9 +5829,7 @@ async fn power_cycle_sim_for_profile_switch_inner(
         }
     }
 
-    if let Err(err) = power_result {
-        return Err(err);
-    }
+    power_result?;
     if let Err(err) = start_result {
         return Err(format!("SIM 已重新上电，但 ModemManager 启动失败：{err}"));
     }

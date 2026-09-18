@@ -214,7 +214,7 @@ pub fn read_uptime() -> Result<(u64, u64), String> {
     let content = fs::read_to_string("/proc/uptime")
         .map_err(|e| format!("Failed to read /proc/uptime: {}", e))?;
 
-    let parts: Vec<&str> = content.trim().split_whitespace().collect();
+    let parts: Vec<&str> = content.split_whitespace().collect();
     if parts.len() < 2 {
         return Err("Invalid /proc/uptime format".to_string());
     }
@@ -261,80 +261,6 @@ pub fn format_uptime(seconds: u64) -> String {
     parts.join(" ")
 }
 
-/// 读取网络接口的流量统计
-///
-/// # Arguments
-/// * `interface` - 网络接口名称（如 usb0, eth0）
-/// * `conn` - 可选的 D-Bus 连接用于蜂窝接口流量补足 fallback
-///
-/// # Returns
-/// (rx_bytes, tx_bytes)
-pub async fn read_interface_stats(
-    interface: &str,
-    conn: Option<&zbus::Connection>,
-) -> Result<(u64, u64), String> {
-    use std::fs;
-
-    let rx_path = format!("/sys/class/net/{}/statistics/rx_bytes", interface);
-    let tx_path = format!("/sys/class/net/{}/statistics/tx_bytes", interface);
-
-    let mut rx_bytes = fs::read_to_string(&rx_path)
-        .map_err(|e| format!("Failed to read {}: {}", rx_path, e))?
-        .trim()
-        .parse::<u64>()
-        .map_err(|e| format!("Failed to parse rx_bytes: {}", e))?;
-
-    let mut tx_bytes = fs::read_to_string(&tx_path)
-        .map_err(|e| format!("Failed to read {}: {}", tx_path, e))?
-        .trim()
-        .parse::<u64>()
-        .map_err(|e| format!("Failed to parse tx_bytes: {}", e))?;
-
-    if let Some(c) = conn {
-        if let Ok(Some(mm_stats)) =
-            crate::modem_manager::get_bearer_stats_for_interface(c, interface).await
-        {
-            rx_bytes = std::cmp::max(rx_bytes, mm_stats.rx_bytes);
-            tx_bytes = std::cmp::max(tx_bytes, mm_stats.tx_bytes);
-        }
-    }
-
-    Ok((rx_bytes, tx_bytes))
-}
-
-/// 获取所有活跃的网络接口列表
-///
-/// # Returns
-/// 网络接口名称列表（排除 lo）
-pub fn get_active_interfaces() -> Result<Vec<String>, String> {
-    use std::fs;
-
-    let entries = fs::read_dir("/sys/class/net")
-        .map_err(|e| format!("Failed to read /sys/class/net: {}", e))?;
-
-    let mut interfaces = Vec::new();
-
-    for entry in entries {
-        let entry = entry.map_err(|e| format!("Failed to read directory entry: {}", e))?;
-        let name = entry.file_name().to_string_lossy().to_string();
-
-        // 排除回环接口
-        if name != "lo" {
-            // 检查接口是否 up
-            let operstate_path = format!("/sys/class/net/{}/operstate", name);
-            if let Ok(state) = fs::read_to_string(&operstate_path) {
-                let state = state.trim();
-                // 包含 up 和 unknown 状态的接口（unknown 可能是某些虚拟接口）
-                if state == "up" || state == "unknown" {
-                    interfaces.push(name);
-                }
-            }
-        }
-    }
-
-    Ok(interfaces)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -368,13 +294,28 @@ nm-bridge\t0044A8C0\t00000000\t0001\t0\t0\t425\t00FFFFFF\t0\t0\t0";
     #[test]
     fn test_normalize_iccid() {
         // 19位 纯数字 -> 保持前19位不变
-        assert_eq!(normalize_iccid("8986000000000000001"), "8986000000000000001");
+        assert_eq!(
+            normalize_iccid("8986000000000000001"),
+            "8986000000000000001"
+        );
         // 20位 带尾部 F -> 去掉 F 并保留前19位
-        assert_eq!(normalize_iccid("8986000000000000001F"), "8986000000000000001");
-        assert_eq!(normalize_iccid("8986000000000000001f"), "8986000000000000001");
+        assert_eq!(
+            normalize_iccid("8986000000000000001F"),
+            "8986000000000000001"
+        );
+        assert_eq!(
+            normalize_iccid("8986000000000000001f"),
+            "8986000000000000001"
+        );
         // 正常的 20位数字 -> 截断并保留前19位
-        assert_eq!(normalize_iccid("89860000000000000018"), "8986000000000000001");
-        assert_eq!(normalize_iccid("89860000000000000010"), "8986000000000000001");
+        assert_eq!(
+            normalize_iccid("89860000000000000018"),
+            "8986000000000000001"
+        );
+        assert_eq!(
+            normalize_iccid("89860000000000000010"),
+            "8986000000000000001"
+        );
         // 空字符串 -> 保持空
         assert_eq!(normalize_iccid(""), "");
     }
@@ -1167,7 +1108,7 @@ pub fn preferred_interface_for_family(
         .iter()
         .filter(|iface| {
             iface.name != "lo"
-                && iface.status.to_ascii_lowercase() != "down"
+                && !iface.status.eq_ignore_ascii_case("down")
                 && !interface_addresses_for_family(&iface.ip_addresses, family).is_empty()
         })
         .min_by_key(|iface| preferred_interface_priority(iface, family))
@@ -1329,8 +1270,8 @@ pub async fn read_network_interfaces(
                 .ok()
                 .and_then(|s| {
                     let s = s.trim();
-                    if s.starts_with("0x") {
-                        u32::from_str_radix(&s[2..], 16).ok()
+                    if let Some(hex) = s.strip_prefix("0x") {
+                        u32::from_str_radix(hex, 16).ok()
                     } else {
                         s.parse::<u32>().ok()
                     }
@@ -1388,4 +1329,3 @@ pub fn normalize_iccid(iccid: &str) -> String {
     }
     cleaned
 }
-

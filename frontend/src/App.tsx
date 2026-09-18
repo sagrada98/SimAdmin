@@ -3,7 +3,7 @@ import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-route
 import { QueryClientProvider } from '@tanstack/react-query'
 import { Box, CircularProgress } from '@mui/material'
 import { ThemeProvider } from './contexts/ThemeContext'
-import { WorkModeProvider } from './contexts/WorkModeContext'
+import { WorkModeProvider, useWorkMode } from './contexts/WorkModeContext'
 import { queryClient } from './lib/queryClient'
 import MainLayout from './components/Layout/MainLayout'
 import { api, type AuthStatusResponse } from './api/current'
@@ -19,6 +19,7 @@ const SMS = lazy(() => import('./pages/SMS'))
 const NotificationCenter = lazy(() => import('./pages/NotificationCenter'))
 const Phone = lazy(() => import('./pages/Phone'))
 const Configuration = lazy(() => import('./pages/Configuration'))
+const BackupRestore = lazy(() => import('./pages/BackupRestore'))
 const OtaUpdate = lazy(() => import('./pages/OtaUpdate'))
 const Login = lazy(() => import('./pages/Login'))
 const AutomationCenter = lazy(() => import('./pages/AutomationCenter'))
@@ -71,7 +72,7 @@ function ProtectedShell() {
 
   useEffect(() => {
     const idleTimeoutSeconds = authStatus?.settings?.idle_timeout_seconds ?? 0
-    const passwordProtectionEnabled = authStatus?.settings?.password_protection_enabled ?? true
+    const passwordProtectionEnabled = authStatus?.settings?.password_protection_enabled ?? false
     if (!allowed || !passwordProtectionEnabled || idleTimeoutSeconds <= 0) return undefined
 
     let timer: number | undefined
@@ -109,9 +110,16 @@ function ProtectedShell() {
 
   return (
     <WorkModeProvider>
-      <MainLayout />
+      <MainLayout
+        showLogout={authStatus?.settings?.password_protection_enabled === true}
+      />
     </WorkModeProvider>
   )
+}
+
+function EsimRouteRedirect() {
+  const { esimSupported } = useWorkMode()
+  return <Navigate to={esimSupported ? '/sim?tab=esim' : '/sim'} replace />
 }
 
 function App() {
@@ -124,7 +132,7 @@ function App() {
             <Route path="/" element={<ProtectedShell />}>
               <Route index element={<Suspense fallback={<PageLoading />}><Dashboard /></Suspense>} />
               <Route path="sim" element={<Suspense fallback={<PageLoading />}><SimCard /></Suspense>} />
-              <Route path="esim" element={<Navigate to="/sim?tab=esim" replace />} />
+              <Route path="esim" element={<EsimRouteRedirect />} />
               <Route path="network" element={<Suspense fallback={<PageLoading />}><Network /></Suspense>} />
               <Route path="device-network" element={<Suspense fallback={<PageLoading />}><DeviceNetwork /></Suspense>} />
               {/* 旧路由重定向到网络状态页面 */}
@@ -136,6 +144,7 @@ function App() {
               <Route path="phone" element={<Suspense fallback={<PageLoading />}><Phone /></Suspense>} />
               <Route path="config" element={<Suspense fallback={<PageLoading />}><Configuration /></Suspense>} />
               <Route path="config/security" element={<Suspense fallback={<PageLoading />}><Configuration /></Suspense>} />
+              <Route path="config/backup" element={<Suspense fallback={<PageLoading />}><BackupRestore /></Suspense>} />
               <Route path="ota" element={<Suspense fallback={<PageLoading />}><OtaUpdate /></Suspense>} />
             </Route>
           </Routes>

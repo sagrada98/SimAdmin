@@ -76,6 +76,7 @@ pub mod codes {
         "esim.profile_switch_baseband_recovery_failed";
     pub const ESIM_PROFILE_DOWNLOAD_SUCCEEDED: &str = "esim.profile_download_succeeded";
     pub const ESIM_PROFILE_DOWNLOAD_FAILED: &str = "esim.profile_download_failed";
+    pub const ESIM_RSP_NOTIFICATION_DELIVERY_FAILED: &str = "esim.rsp_notification_delivery_failed";
 
     pub const RESOURCE_TEMPERATURE_HIGH: &str = "resource.temperature_high";
     pub const RESOURCE_TEMPERATURE_RECOVERED: &str = "resource.temperature_recovered";
@@ -343,6 +344,13 @@ pub const SYSTEM_EVENT_DEFINITIONS: &[SystemEventDefinition] = &[
         true,
     ),
     def(
+        codes::ESIM_RSP_NOTIFICATION_DELIVERY_FAILED,
+        category::ESIM,
+        "SIM/eSIM",
+        "运营商 Profile 通知提交失败",
+        true,
+    ),
+    def(
         codes::RESOURCE_TEMPERATURE_HIGH,
         category::RESOURCE,
         "资源告警",
@@ -458,7 +466,7 @@ const fn def(
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, serde::Deserialize, Serialize)]
 pub struct SystemEvent {
     pub category: String,
     pub category_label: String,

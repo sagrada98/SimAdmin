@@ -26,6 +26,7 @@ use zbus::Connection;
 
 mod auth;
 mod automation;
+mod backup;
 mod cell_lock_store;
 mod config;
 mod db;
@@ -33,9 +34,11 @@ mod device_network;
 mod device_status;
 mod esim;
 mod handlers;
+mod hub_agent;
 mod iptables;
 mod models;
 mod modem_manager;
+mod modem_recovery;
 mod notification;
 mod notification_queue;
 mod ota;
@@ -55,7 +58,7 @@ use handlers::*;
 use modem_manager::{ensure_nm_modem_profile, init_data_connection};
 use notification::NotificationSender;
 use notification_queue::*;
-use state::AppState;
+use state::{AppState, AppStateDependencies};
 use system_event::{
     codes as system_event_codes, severity as system_event_severity, status as system_event_status,
     SystemEventEmitter,
@@ -76,6 +79,9 @@ fn get_www_dir() -> PathBuf {
 }
 
 fn get_data_db_path() -> PathBuf {
+    if let Some(path) = std::env::var_os("SIMADMIN_DATA_DIR") {
+        return PathBuf::from(path).join("data.db");
+    }
     std::env::current_exe()
         .expect("Failed to get executable path")
         .parent()
@@ -148,7 +154,9 @@ async fn spa_fallback(uri: Uri) -> Response {
 /// 这完美绕过了 Modem.Command 的 Unauthorized 限制，同时保持系统纯净。
 fn ensure_modemmanager_debug_override() {
     let override_dir = "/etc/systemd/system/ModemManager.service.d";
-    let override_file = "/etc/systemd/system/ModemManager.service.d/99-simadmin-debug.conf";
+    let legacy_override_file = "/etc/systemd/system/ModemManager.service.d/99-simadmin-debug.conf";
+    let override_file = "/etc/systemd/system/ModemManager.service.d/zz-simadmin-debug.conf";
+    let _ = std::fs::remove_file(legacy_override_file);
 
     let desired_content = "\
 # SimAdmin: enable ModemManager debug mode so that Modem.Command D-Bus
@@ -311,6 +319,7 @@ async fn main() -> Result<()> {
 
     // 确保 ModemManager 已提权以支持 AT 指令读取短信中心
     ensure_modemmanager_debug_override();
+    modem_recovery::ensure_modem_recovery_assets_installed();
 
     // Connect to system D-Bus
     let dbus_conn = Arc::new(Connection::system().await?);
@@ -323,6 +332,15 @@ async fn main() -> Result<()> {
     let config_path = get_default_config_path();
     info!(path = ?config_path, "Loading config");
     let config_manager = Arc::new(ConfigManager::new(config_path));
+    if local_device_service_mode() {
+        let mut hub = config_manager.get_hub_config();
+        if !hub.enabled {
+            hub.enabled = true;
+            config_manager
+                .set_hub_config(hub)
+                .map_err(anyhow::Error::msg)?;
+        }
+    }
     let data_user_disabled = Arc::new(AtomicBool::new(!config_manager.get_data_enabled()));
     let airplane_mode_requested = Arc::new(AtomicBool::new(false));
     let cell_monitoring_active = Arc::new(AtomicBool::new(false));
@@ -483,25 +501,40 @@ async fn main() -> Result<()> {
     // 创建统一的应用状态
     spawn_system_stats_sampler(Arc::clone(&dbus_conn));
 
-    let app_state = AppState::new(
+    let app_state = AppState::new(AppStateDependencies {
         dbus_conn,
-        app_db,
+        database: app_db,
         config_manager,
         notification_sender,
         system_event_emitter,
         ddns_manager,
-        Arc::clone(&esim_supervisor),
+        esim_supervisor: Arc::clone(&esim_supervisor),
         sms_resync,
         data_user_disabled,
         airplane_mode_requested,
         cell_monitoring_active,
-    );
+    });
+
+    app_state
+        .hub_agent_manager
+        .initialize(app_state.clone(), args.port)
+        .await;
 
     // 启动自动化中心后台调度引擎
     automation::spawn_automation_scheduler(app_state.clone());
 
     // Build protected routes - 使用统一的 AppState
-    let protected_routes = Router::new()
+    let device_routes = Router::new()
+        .route(
+            "/api/hub",
+            get(hub_agent::get_hub_settings)
+                .post(hub_agent::save_hub_settings)
+                .options(options_handler),
+        )
+        .route(
+            "/api/hub/unbind",
+            post(hub_agent::unbind_hub).options(options_handler),
+        )
         // ========== 设备信息接口 ==========
         .route("/api/device", get(get_device_info).options(options_handler))
         // ========== SIM 卡接口 ==========
@@ -878,6 +911,59 @@ async fn main() -> Result<()> {
             "/api/automation/test/{task_id}",
             post(test_automation_task_handler).options(options_handler),
         )
+        // ========== 备份与恢复接口 ==========
+        .route(
+            "/api/backup/options",
+            get(backup::get_backup_options_handler).options(options_handler),
+        )
+        .route(
+            "/api/backup/config",
+            get(backup::get_backup_config_handler)
+                .post(backup::set_backup_config_handler)
+                .options(options_handler),
+        )
+        .route(
+            "/api/backup/export",
+            post(backup::export_backup_handler).options(options_handler),
+        )
+        .route(
+            "/api/backup/export-local",
+            post(backup::export_backup_local_handler).options(options_handler),
+        )
+        .route(
+            "/api/backup/data/clear",
+            post(backup::clear_backup_data_handler).options(options_handler),
+        )
+        .route(
+            "/api/backup/import/preview",
+            post(backup::preview_backup_import_handler)
+                .options(options_handler)
+                .layer(DefaultBodyLimit::max(50 * 1024 * 1024)),
+        )
+        .route(
+            "/api/backup/import/apply",
+            post(backup::apply_backup_import_handler)
+                .options(options_handler)
+                .layer(DefaultBodyLimit::max(50 * 1024 * 1024)),
+        )
+        .route(
+            "/api/backup/files",
+            get(backup::get_backup_files_handler).options(options_handler),
+        )
+        .route(
+            "/api/backup/files/{filename}/preview",
+            get(backup::preview_backup_file_handler).options(options_handler),
+        )
+        .route(
+            "/api/backup/files/{filename}/apply",
+            post(backup::apply_backup_file_handler).options(options_handler),
+        )
+        .route(
+            "/api/backup/files/{filename}",
+            get(backup::download_backup_file_handler)
+                .delete(backup::delete_backup_file_handler)
+                .options(options_handler),
+        )
         .route(
             "/api/ota/status",
             get(get_ota_status_handler).options(options_handler),
@@ -903,7 +989,9 @@ async fn main() -> Result<()> {
         .route(
             "/api/ota/cancel",
             post(cancel_ota_handler).options(options_handler),
-        )
+        );
+    hub_agent::configure_device_api_router(device_routes.clone().with_state(app_state.clone()));
+    let protected_routes = device_routes
         .route(
             "/api/auth/password",
             post(auth::change_password).options(options_handler),
@@ -921,6 +1009,10 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/api/health", get(health_check).options(options_handler))
+        .route(
+            "/api/hub/provision",
+            post(hub_agent::provision_device).options(options_handler),
+        )
         .route(
             "/api/auth/status",
             get(auth::status).options(options_handler),
@@ -960,6 +1052,12 @@ async fn main() -> Result<()> {
         .await?;
 
     Ok(())
+}
+
+fn local_device_service_mode() -> bool {
+    std::env::var("SIMADMIN_DEVICE_SERVICE")
+        .ok()
+        .is_some_and(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
 }
 
 /// 绑定端口，如果被占用则轮询等待

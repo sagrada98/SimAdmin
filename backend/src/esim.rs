@@ -17,12 +17,13 @@ use tokio::sync::Mutex;
 use crate::config::ConfigManager;
 use crate::models::{
     EsimCommandResponse, EsimDownloadRequest, EsimEuiccInfo, EsimLpacRepairRequest,
-    EsimLpacRepairResponse, EsimLpacStatusResponse, EsimProfile, EsimProfilesResponse, WorkMode,
-    WorkModeResponse,
+    EsimLpacRepairResponse, EsimLpacStatusResponse, EsimProfile, EsimProfilesResponse,
+    EsimRspNotification, WorkMode, WorkModeResponse,
 };
 
 const ESIM_SHORT_TIMEOUT_SECS: u64 = 20;
 const ESIM_LONG_TIMEOUT_SECS: u64 = 60;
+const ESIM_SWITCH_PREFLIGHT_TIMEOUT_SECS: u64 = 5;
 const LPAC_REPAIR_TIMEOUT_SECS: u64 = 120;
 const LPAC_PROBE_TIMEOUT_SECS: u64 = 3;
 const MAX_LPAC_DOWNLOAD_BYTES: usize = 25 * 1024 * 1024;
@@ -70,10 +71,34 @@ impl EsimSupervisor {
     }
 
     pub async fn worker_running(&self) -> bool {
-        self.config_manager.get_work_mode() == WorkMode::Esim
+        self.config_manager.get_work_mode() == WorkMode::Esim && self.esim_supported().await
+    }
+
+    pub async fn esim_supported(&self) -> bool {
+        detect_machine_arch()
+            .await
+            .ok()
+            .and_then(|raw| normalize_lpac_arch(&raw))
+            .is_some()
+    }
+
+    /// ARMv7 MVP does not ship an lpac runtime. Keep this guard at the
+    /// supervisor boundary so cached and mutating eSIM APIs cannot bypass it.
+    pub async fn ensure_lpac_supported(&self) -> Result<(), EsimApiError> {
+        let raw_arch = detect_machine_arch()
+            .await
+            .map_err(|err| EsimApiError::Command(format!("Failed to detect device arch: {err}")))?;
+        normalize_lpac_arch(&raw_arch)
+            .map(|_| ())
+            .ok_or_else(|| EsimApiError::Unavailable(unsupported_lpac_message(&raw_arch)))
     }
 
     pub async fn switch_mode(&self, target: WorkMode) -> Result<WorkModeResponse, String> {
+        if target == WorkMode::Esim {
+            self.ensure_lpac_supported()
+                .await
+                .map_err(|err| err.message())?;
+        }
         self.config_manager.set_work_mode(target)?;
         let mode = self.config_manager.get_work_mode();
         Ok(WorkModeResponse {
@@ -81,6 +106,7 @@ impl EsimSupervisor {
             // Kept for API compatibility with v1.0.5 clients. There is no
             // worker after the simplification; true means eSIM APIs are enabled.
             worker_running: mode == WorkMode::Esim,
+            esim_supported: self.esim_supported().await,
         })
     }
 
@@ -93,26 +119,35 @@ impl EsimSupervisor {
         let raw_arch = detect_machine_arch()
             .await
             .unwrap_or_else(|err| format!("unknown ({err})"));
-        let arch = normalize_lpac_arch(&raw_arch).unwrap_or("").to_string();
-        let glibc_version = detect_glibc_version().await.unwrap_or_default();
-        let asset_name = if arch.is_empty() {
-            String::new()
-        } else {
-            recommended_lpac_asset_name(&arch, &glibc_version)
-        };
         let command_path = resolve_lpac_path(&self.config_manager.get_esim_config().lpac_path);
+        let Some(arch) = normalize_lpac_arch(&raw_arch) else {
+            let installed = command_path.is_file();
+            let message = unsupported_lpac_message(&raw_arch);
+            return Ok(EsimLpacStatusResponse {
+                installed,
+                usable: false,
+                path: command_path.to_string_lossy().to_string(),
+                arch: String::new(),
+                glibc_version: String::new(),
+                asset_name: String::new(),
+                message,
+                source: read_lpac_source(),
+            });
+        };
+        let glibc_version = detect_glibc_version().await.unwrap_or_default();
+        let asset_name = recommended_lpac_asset_name(arch, &glibc_version);
         let probe = probe_lpac_binary(&command_path).await;
-        let message = if arch.is_empty() && !probe.usable {
-            format!("unsupported device architecture: {raw_arch}")
-        } else {
+        let message = if !probe.usable && !probe.message.is_empty() {
             probe.message
+        } else {
+            "lpac is available".to_string()
         };
 
         Ok(EsimLpacStatusResponse {
             installed: probe.installed,
             usable: probe.usable,
             path: command_path.to_string_lossy().to_string(),
-            arch,
+            arch: arch.to_string(),
             glibc_version,
             asset_name,
             message,
@@ -132,9 +167,8 @@ impl EsimSupervisor {
         let raw_arch = detect_machine_arch()
             .await
             .map_err(|err| EsimApiError::Command(format!("Failed to detect device arch: {err}")))?;
-        let arch = normalize_lpac_arch(&raw_arch).ok_or_else(|| {
-            EsimApiError::Command(format!("unsupported device architecture: {raw_arch}"))
-        })?;
+        let arch = normalize_lpac_arch(&raw_arch)
+            .ok_or_else(|| EsimApiError::Unavailable(unsupported_lpac_message(&raw_arch)))?;
         let glibc_version = detect_glibc_version().await.unwrap_or_default();
         let requested_asset_url = request
             .asset_url
@@ -208,6 +242,8 @@ impl EsimSupervisor {
             return Err(EsimApiError::Disabled);
         }
 
+        self.ensure_lpac_supported().await?;
+
         let _guard = self.lpac_lock.lock().await;
         run_lpac_command(
             &self.config_manager.get_esim_config().lpac_path,
@@ -248,10 +284,80 @@ impl EsimSupervisor {
         Ok(normalize_profiles(response))
     }
 
+    pub async fn get_profiles_for_switch(&self) -> Result<EsimProfilesResponse, EsimApiError> {
+        let response = self
+            .call_lpac(
+                "profiles",
+                &["profile", "list"],
+                ESIM_SWITCH_PREFLIGHT_TIMEOUT_SECS,
+            )
+            .await?;
+        if !command_succeeded(&response) {
+            return Err(EsimApiError::Command(response.msg));
+        }
+        Ok(normalize_profiles(response))
+    }
+
+    /// 读取 eUICC 中尚未处理的 RSP Profile 管理通知。
+    pub async fn get_rsp_notifications(&self) -> Result<Vec<EsimRspNotification>, EsimApiError> {
+        let response = self
+            .call_lpac(
+                "notifications",
+                &["notification", "list"],
+                ESIM_SHORT_TIMEOUT_SECS,
+            )
+            .await?;
+        if !command_succeeded(&response) {
+            return Err(EsimApiError::Command(response.msg));
+        }
+        Ok(normalize_rsp_notifications(response))
+    }
+
+    /// 将指定 RSP 通知提交到运营商服务器，但不从 eUICC 删除。
+    pub async fn process_rsp_notification(&self, sequence_number: u64) -> Result<(), EsimApiError> {
+        self.run_rsp_notification_command("process", sequence_number)
+            .await
+    }
+
+    /// 从 eUICC 删除已经成功提交的 RSP 通知。
+    pub async fn remove_rsp_notification(&self, sequence_number: u64) -> Result<(), EsimApiError> {
+        self.run_rsp_notification_command("remove", sequence_number)
+            .await
+    }
+
+    async fn run_rsp_notification_command(
+        &self,
+        subcommand: &str,
+        sequence_number: u64,
+    ) -> Result<(), EsimApiError> {
+        let sequence_number = sequence_number.to_string();
+        let response = self
+            .call_lpac(
+                "notification",
+                &["notification", subcommand, sequence_number.as_str()],
+                ESIM_LONG_TIMEOUT_SECS,
+            )
+            .await?;
+        if command_succeeded(&response) {
+            Ok(())
+        } else {
+            Err(EsimApiError::Command(response.msg))
+        }
+    }
+
     pub async fn enable_profile(&self, iccid: String) -> Result<EsimCommandResponse, EsimApiError> {
+        self.enable_profile_with_refresh_flag(iccid, true).await
+    }
+
+    pub async fn enable_profile_with_refresh_flag(
+        &self,
+        identifier: String,
+        refresh: bool,
+    ) -> Result<EsimCommandResponse, EsimApiError> {
+        let refresh_flag = if refresh { "1" } else { "0" };
         self.call_lpac(
             "enable",
-            &["profile", "enable", iccid.as_str(), "1"],
+            &["profile", "enable", identifier.as_str(), refresh_flag],
             ESIM_LONG_TIMEOUT_SECS,
         )
         .await
@@ -316,6 +422,33 @@ fn command_succeeded(response: &EsimCommandResponse) -> bool {
             || response.status.eq_ignore_ascii_case("ok"))
 }
 
+fn normalize_rsp_notifications(response: EsimCommandResponse) -> Vec<EsimRspNotification> {
+    response
+        .data
+        .as_ref()
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|value| {
+            let sequence_number = value
+                .get("seqNumber")
+                .or_else(|| value.get("sequenceNumber"))
+                .or_else(|| value.get("sequence_number"))
+                .and_then(|value| {
+                    value
+                        .as_u64()
+                        .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+                })?;
+            Some(EsimRspNotification {
+                sequence_number,
+                operation: string_from(value, &["profileManagementOperation", "operation"])
+                    .unwrap_or_default(),
+                iccid: string_from(value, &["iccid", "ICCID"]).unwrap_or_default(),
+            })
+        })
+        .collect()
+}
+
 struct LpacProbe {
     installed: bool,
     usable: bool,
@@ -351,8 +484,12 @@ fn normalize_lpac_arch(raw: &str) -> Option<&'static str> {
     }
 }
 
+fn unsupported_lpac_message(raw_arch: &str) -> String {
+    format!("lpac/eSIM is not supported on this architecture ({raw_arch}); ARMv7 MVP excludes lpac")
+}
+
 async fn detect_glibc_version() -> Result<String, String> {
-    if let Ok(output) = tokio::time::timeout(
+    if let Ok(Ok(output)) = tokio::time::timeout(
         Duration::from_secs(LPAC_PROBE_TIMEOUT_SECS),
         tokio::process::Command::new("getconf")
             .arg("GNU_LIBC_VERSION")
@@ -360,13 +497,11 @@ async fn detect_glibc_version() -> Result<String, String> {
     )
     .await
     {
-        if let Ok(output) = output {
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                if let Some(version) = stdout.split_whitespace().last() {
-                    if !version.trim().is_empty() {
-                        return Ok(version.trim().to_string());
-                    }
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if let Some(version) = stdout.split_whitespace().last() {
+                if !version.trim().is_empty() {
+                    return Ok(version.trim().to_string());
                 }
             }
         }
@@ -396,10 +531,18 @@ fn find_version_token(text: &str) -> Option<String> {
 }
 
 fn recommended_lpac_asset_name(arch: &str, glibc_version: &str) -> String {
-    if arch == "aarch64" && version_le("2.31", glibc_version).unwrap_or(false) {
-        return "lpac-linux-aarch64-glibc2.31.zip".to_string();
+    if matches!(arch, "aarch64" | "x86_64") && version_le("2.31", glibc_version).unwrap_or(false) {
+        return format!("lpac-linux-{arch}-glibc2.31.zip");
     }
-    format!("lpac-linux-{arch}.zip")
+    format!("lpac-linux-{arch}-with-qmi.zip")
+}
+
+fn official_lpac_asset_names(arch: &str) -> [String; 3] {
+    [
+        format!("lpac-linux-{arch}-with-qmi.zip"),
+        format!("lpac-linux-{arch}.zip"),
+        format!("lpac-linux-{arch}-without-lto.zip"),
+    ]
 }
 
 async fn resolve_lpac_asset_candidates(
@@ -415,11 +558,7 @@ async fn resolve_lpac_asset_candidates(
         candidates.append(&mut manifest_candidates);
     }
 
-    for name in [
-        format!("lpac-linux-{arch}.zip"),
-        format!("lpac-linux-{arch}-with-qmi.zip"),
-        format!("lpac-linux-{arch}-without-lto.zip"),
-    ] {
+    for name in official_lpac_asset_names(arch) {
         candidates.push(LpacAssetCandidate {
             url: format!("{LPAC_OFFICIAL_RELEASE_BASE_URL}/{name}"),
             name,
@@ -508,7 +647,10 @@ fn parse_version_parts(value: &str) -> Vec<u32> {
 
 async fn probe_lpac_binary(command_path: &Path) -> LpacProbe {
     let mut command = tokio::process::Command::new(command_path);
+    command.args(["driver", "list"]);
     configure_lpac_environment(&mut command, command_path);
+    command.env("LPAC_APDU", "stdio");
+    command.env("LPAC_HTTP", "stdio");
 
     let output = match tokio::time::timeout(
         Duration::from_secs(LPAC_PROBE_TIMEOUT_SECS),
@@ -543,14 +685,28 @@ async fn probe_lpac_binary(command_path: &Path) -> LpacProbe {
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     let combined = format!("{stdout}\n{stderr}");
-    if combined.contains("GLIBC_")
-        || combined.contains("No such file or directory")
-        || combined.contains("Permission denied")
-    {
+    if !output.status.success() {
         return LpacProbe {
             installed: true,
             usable: false,
-            message: if stderr.is_empty() { stdout } else { stderr },
+            message: if stderr.is_empty() {
+                if stdout.is_empty() {
+                    format!("lpac driver probe exited with {}", output.status)
+                } else {
+                    stdout
+                }
+            } else {
+                stderr
+            },
+        };
+    }
+
+    if !lpac_driver_list_has_required_drivers(&combined) {
+        return LpacProbe {
+            installed: true,
+            usable: false,
+            message: "lpac does not provide the required qmi APDU and curl HTTP drivers"
+                .to_string(),
         };
     }
 
@@ -559,6 +715,25 @@ async fn probe_lpac_binary(command_path: &Path) -> LpacProbe {
         usable: true,
         message: "lpac is available".to_string(),
     }
+}
+
+fn lpac_driver_list_has_required_drivers(output: &str) -> bool {
+    let value = output
+        .lines()
+        .rev()
+        .find_map(|line| serde_json::from_str::<Value>(line.trim()).ok());
+    let Some(value) = value else {
+        return false;
+    };
+    let payload = value.get("payload").unwrap_or(&value);
+    let has_driver = |kind: &str, name: &str| {
+        payload
+            .get(kind)
+            .and_then(Value::as_array)
+            .map(|drivers| drivers.iter().any(|driver| driver.as_str() == Some(name)))
+            .unwrap_or(false)
+    };
+    has_driver("LPAC_APDU", "qmi") && has_driver("LPAC_HTTP", "curl")
 }
 
 fn read_lpac_source() -> Option<String> {
@@ -646,6 +821,7 @@ async fn install_lpac_asset(bytes: &[u8], asset_url: &str) -> Result<(), EsimApi
             .map_err(|err| EsimApiError::Command(format!("Failed to create lpac dir: {err}")))?;
         copy_dir_recursive(&bundle_root, &new_dir)?;
         copy_optional_lpac_libs(&extract_dir, &new_dir)?;
+        normalize_lpac_library_links(&new_dir)?;
         fs::write(
             new_dir.join("SOURCE.txt"),
             format!(
@@ -752,6 +928,52 @@ fn copy_optional_lpac_libs(extract_dir: &Path, target_dir: &Path) -> Result<(), 
             })?;
             copy_dir_recursive(&source, &target_lib)?;
             return Ok(());
+        }
+    }
+    Ok(())
+}
+
+fn normalize_lpac_library_links(target_dir: &Path) -> Result<(), EsimApiError> {
+    let library_dir = target_dir.join("lib");
+    if !library_dir.is_dir() {
+        return Ok(());
+    }
+    for library in ["libqmi-glib", "libmbim-glib"] {
+        let prefix = format!("{library}.so.");
+        let real_library = fs::read_dir(&library_dir)
+            .map_err(|err| EsimApiError::Command(format!("Failed to read lpac libraries: {err}")))?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| name.strip_prefix(&prefix))
+                    .is_some_and(|version| version.matches('.').count() >= 2)
+            });
+        let Some(real_library) = real_library else {
+            continue;
+        };
+        let real_name = real_library
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| EsimApiError::Command("Invalid lpac library name".to_string()))?;
+        let major = real_name
+            .strip_prefix(&prefix)
+            .and_then(|version| version.split('.').next())
+            .ok_or_else(|| EsimApiError::Command("Invalid lpac library version".to_string()))?;
+        for alias in [format!("{library}.so"), format!("{library}.so.{major}")] {
+            let alias = library_dir.join(alias);
+            if alias == real_library {
+                continue;
+            }
+            if alias.exists() {
+                fs::remove_file(&alias).map_err(|err| {
+                    EsimApiError::Command(format!("Failed to replace lpac library alias: {err}"))
+                })?;
+            }
+            fs::hard_link(&real_library, &alias).map_err(|err| {
+                EsimApiError::Command(format!("Failed to link lpac library alias: {err}"))
+            })?;
         }
     }
     Ok(())
@@ -958,7 +1180,8 @@ fn resolve_lpac_path(lpac_path: &str) -> PathBuf {
 fn configure_lpac_environment(command: &mut tokio::process::Command, command_path: &Path) {
     set_env_default(command, "LPAC_APDU", "qmi");
     set_env_default(command, "LPAC_HTTP", "curl");
-    set_env_default(command, "LPAC_APDU_QMI_DEVICE", "/dev/wwan0qmi0");
+    let qmi_device = discover_lpac_qmi_device();
+    set_env_default(command, "LPAC_APDU_QMI_DEVICE", &qmi_device);
     set_env_default(command, "LPAC_APDU_QMI_UIM_SLOT", "1");
     set_env_default(command, "LPAC_APDU_AT_DEVICE", "/dev/wwan0at0");
 
@@ -976,6 +1199,42 @@ fn configure_lpac_environment(command: &mut tokio::process::Command, command_pat
             command.env("LD_LIBRARY_PATH", ld_library_path);
         }
     }
+}
+
+fn discover_lpac_qmi_device() -> String {
+    let candidates = fs::read_dir("/dev")
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+            name.starts_with("cdc-wdm") || (name.starts_with("wwan") && name.contains("qmi"))
+        })
+        .collect::<Vec<_>>();
+
+    select_lpac_qmi_device(candidates)
+        .unwrap_or_else(|| PathBuf::from("/dev/cdc-wdm0"))
+        .to_string_lossy()
+        .to_string()
+}
+
+fn select_lpac_qmi_device(mut candidates: Vec<PathBuf>) -> Option<PathBuf> {
+    candidates.sort_by(|left, right| {
+        let priority = |path: &Path| {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+            (!name.starts_with("cdc-wdm"), name.to_string())
+        };
+        priority(left).cmp(&priority(right))
+    });
+    candidates.into_iter().next()
 }
 
 fn set_env_default(command: &mut tokio::process::Command, key: &str, value: &str) {
@@ -1491,6 +1750,84 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn recommends_compatible_lpac_for_supported_architectures() {
+        assert_eq!(
+            recommended_lpac_asset_name("x86_64", "2.39"),
+            "lpac-linux-x86_64-glibc2.31.zip"
+        );
+        assert_eq!(
+            recommended_lpac_asset_name("aarch64", "2.39"),
+            "lpac-linux-aarch64-glibc2.31.zip"
+        );
+        assert_eq!(
+            official_lpac_asset_names("x86_64")[0],
+            "lpac-linux-x86_64-with-qmi.zip"
+        );
+    }
+
+    #[test]
+    fn keeps_armv7_lpac_explicitly_unsupported_for_mvp() {
+        assert!(normalize_lpac_arch("armv7l").is_none());
+        assert!(normalize_lpac_arch("armhf").is_none());
+        assert!(unsupported_lpac_message("armv7l").contains("ARMv7 MVP excludes lpac"));
+    }
+
+    #[test]
+    fn validates_required_lpac_drivers() {
+        let valid = json!({
+            "type": "driver",
+            "payload": {
+                "LPAC_APDU": ["qmi", "pcsc", "stdio"],
+                "LPAC_HTTP": ["curl", "stdio"]
+            }
+        });
+        let missing_qmi = json!({
+            "type": "driver",
+            "payload": {
+                "LPAC_APDU": ["pcsc", "at", "stdio"],
+                "LPAC_HTTP": ["curl", "stdio"]
+            }
+        });
+
+        assert!(lpac_driver_list_has_required_drivers(&valid.to_string()));
+        assert!(!lpac_driver_list_has_required_drivers(
+            &missing_qmi.to_string()
+        ));
+    }
+
+    #[test]
+    fn normalizes_bundled_library_aliases_to_shared_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let library_dir = directory.path().join("lib");
+        fs::create_dir_all(&library_dir).unwrap();
+        fs::write(library_dir.join("libqmi-glib.so.5.11.0"), b"shared-library").unwrap();
+        fs::write(library_dir.join("libqmi-glib.so.5"), b"expanded-alias").unwrap();
+        fs::write(library_dir.join("libqmi-glib.so"), b"expanded-alias").unwrap();
+
+        normalize_lpac_library_links(directory.path()).unwrap();
+
+        assert_eq!(
+            fs::read(library_dir.join("libqmi-glib.so.5")).unwrap(),
+            b"shared-library"
+        );
+        assert_eq!(
+            fs::read(library_dir.join("libqmi-glib.so")).unwrap(),
+            b"shared-library"
+        );
+    }
+
+    #[test]
+    fn qmi_device_selection_prefers_cdc_wdm() {
+        let selected = select_lpac_qmi_device(vec![
+            PathBuf::from("/dev/wwan0qmi0"),
+            PathBuf::from("/dev/cdc-wdm1"),
+            PathBuf::from("/dev/cdc-wdm0"),
+        ]);
+
+        assert_eq!(selected, Some(PathBuf::from("/dev/cdc-wdm0")));
+    }
+
+    #[test]
     fn parses_lpac_chip_info_aliases() {
         let response = EsimCommandResponse {
             data: Some(json!({
@@ -1533,5 +1870,40 @@ mod tests {
         assert_eq!(profile.mnc.as_deref(), Some("010"));
         assert_eq!(profile.disable_allowed, Some(true));
         assert_eq!(profile.delete_allowed, Some(true));
+    }
+
+    #[test]
+    fn parses_rsp_notification_list_and_sequence_aliases() {
+        let response = EsimCommandResponse {
+            data: Some(json!([
+                {
+                    "seqNumber": 41,
+                    "profileManagementOperation": "install",
+                    "iccid": "TEST_ICCID_1"
+                },
+                {
+                    "sequenceNumber": "42",
+                    "operation": "enable",
+                    "ICCID": "TEST_ICCID_2"
+                }
+            ])),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            normalize_rsp_notifications(response),
+            vec![
+                EsimRspNotification {
+                    sequence_number: 41,
+                    operation: "install".to_string(),
+                    iccid: "TEST_ICCID_1".to_string(),
+                },
+                EsimRspNotification {
+                    sequence_number: 42,
+                    operation: "enable".to_string(),
+                    iccid: "TEST_ICCID_2".to_string(),
+                },
+            ]
+        );
     }
 }

@@ -16,6 +16,7 @@ import {
   FormControl,
   FormControlLabel,
   IconButton,
+  InputAdornment,
   InputLabel,
   List,
   ListItem,
@@ -45,10 +46,13 @@ import {
   Settings,
   SettingsEthernet,
   Terminal,
+  Visibility,
+  VisibilityOff,
   Wifi,
   WifiOff,
 } from '@mui/icons-material'
-import { api, type DdnsConfig, type DdnsLogEntry, type DdnsStatusResponse, type NetworkInterfaceInfo, type WlanNetwork, type WlanSavedNetwork, type WlanStatusResponse } from '../api/current'
+import { type DdnsConfig, type DdnsLogEntry, type DdnsStatusResponse, type NetworkInterfaceInfo, type WlanNetwork, type WlanSavedNetwork, type WlanStatusResponse } from '../api/current'
+import { useSimAdminApi } from '../contexts/ApiContext'
 import ErrorSnackbar from '../components/ErrorSnackbar'
 import { useRefreshInterval } from '../contexts/RefreshContext'
 import { publicIpv6AddressEntries } from '@/utils/ip'
@@ -386,6 +390,7 @@ function isPublicIpv6Address(address: string) {
 }
 
 export default function DeviceNetworkPage() {
+  const api = useSimAdminApi()
   const { refreshInterval, refreshKey } = useRefreshInterval()
   const [tabValue, setTabValue] = useState(0)
   const [loading, setLoading] = useState(true)
@@ -413,6 +418,7 @@ export default function DeviceNetworkPage() {
   const [forgettingNetwork, setForgettingNetwork] = useState<string | null>(null)
   const [selectedNetwork, setSelectedNetwork] = useState<WlanNetwork | null>(null)
   const [wifiPassword, setWifiPassword] = useState('')
+  const [showWifiPassword, setShowWifiPassword] = useState(false)
   const [connectOpen, setConnectOpen] = useState(false)
   const [disconnecting, setDisconnecting] = useState(false)
   const [closeConfirmOpen, setCloseConfirmOpen] = useState(false)
@@ -507,7 +513,7 @@ export default function DeviceNetworkPage() {
       cancelled = true
       window.clearInterval(timer)
     }
-  }, [refreshInterval, refreshKey, tabValue])
+  }, [api, refreshInterval, refreshKey, tabValue])
 
   const applyWlanStatus = (status: WlanStatusResponse) => {
     setWlanStatus(status)
@@ -529,7 +535,7 @@ export default function DeviceNetworkPage() {
     } catch {
       setSavedNetworks([])
     }
-  }, [])
+  }, [api])
 
   const handleTabChange = (_event: SyntheticEvent, value: number) => setTabValue(value)
 
@@ -645,7 +651,7 @@ export default function DeviceNetworkPage() {
       wlanScanInFlightRef.current = false
       setWlanScanning(false)
     }
-  }, [refreshWlanProfiles])
+  }, [api, refreshWlanProfiles])
 
   useEffect(() => {
     if (tabValue !== 0 || !wlanStatus?.enabled) return
@@ -700,6 +706,7 @@ export default function DeviceNetworkPage() {
     if (network.connected) return
     setSelectedNetwork(network)
     setWifiPassword('')
+    setShowWifiPassword(false)
     if (network.secure) {
       setConnectOpen(true)
     } else {
@@ -1543,10 +1550,26 @@ export default function DeviceNetworkPage() {
           <TextField
             autoFocus
             fullWidth
-            type="password"
+            type={showWifiPassword ? 'text' : 'password'}
             label="密码"
             value={wifiPassword}
             onChange={(event) => setWifiPassword(event.target.value)}
+            slotProps={{
+              input: {
+                endAdornment: (
+                  <InputAdornment position="end">
+                    <IconButton
+                      size="small"
+                      onClick={() => setShowWifiPassword((prev) => !prev)}
+                      edge="end"
+                      aria-label={showWifiPassword ? '隐藏密码' : '显示密码'}
+                    >
+                      {showWifiPassword ? <VisibilityOff fontSize="small" /> : <Visibility fontSize="small" />}
+                    </IconButton>
+                  </InputAdornment>
+                ),
+              },
+            }}
           />
         </DialogContent>
         <DialogActions>

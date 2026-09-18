@@ -23,3 +23,8 @@ release/
 # 临时目录
 temp/
 .tmp
+test/
+tests/
+build/
+TODO.md
+TODO-VOLTE.md

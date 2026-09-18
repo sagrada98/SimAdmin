@@ -11,6 +11,34 @@ use std::sync::{Arc, RwLock};
 use tracing::{info, warn};
 
 use crate::models::WorkMode;
+pub use simadmin_auth::SecurityConfig;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HubConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default = "default_hub_local_fallback_timeout")]
+    pub local_fallback_timeout_seconds: u64,
+    #[serde(default = "default_true")]
+    pub local_fallback_enabled: bool,
+}
+
+fn default_hub_local_fallback_timeout() -> u64 {
+    120
+}
+
+impl Default for HubConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            url: String::new(),
+            local_fallback_timeout_seconds: default_hub_local_fallback_timeout(),
+            local_fallback_enabled: true,
+        }
+    }
+}
 
 /// Webhook 配置
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -19,6 +47,8 @@ pub struct WebhookConfig {
     pub enabled: bool,
     #[serde(default)]
     pub url: String,
+    #[serde(default = "default_webhook_http_method")]
+    pub http_method: String,
     #[serde(default = "default_true")]
     pub forward_sms: bool,
     #[serde(default = "default_true")]
@@ -115,6 +145,8 @@ pub struct PushPlusConfig {
 pub struct WecomAppConfig {
     #[serde(flatten)]
     pub common: MessageChannelConfig,
+    #[serde(default = "default_wecom_api_base_url")]
+    pub api_base_url: String,
     #[serde(default)]
     pub corp_id: String,
     #[serde(default)]
@@ -131,7 +163,7 @@ pub struct WecomAppConfig {
     pub safe: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WecomRobotConfig {
     #[serde(flatten)]
     pub common: MessageChannelConfig,
@@ -141,7 +173,7 @@ pub struct WecomRobotConfig {
     pub key: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DingtalkRobotConfig {
     #[serde(flatten)]
     pub common: MessageChannelConfig,
@@ -173,7 +205,7 @@ pub struct DingtalkAppConfig {
     pub msg_key: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct FeishuRobotConfig {
     #[serde(flatten)]
     pub common: MessageChannelConfig,
@@ -189,6 +221,8 @@ pub struct FeishuRobotConfig {
 pub struct TelegramConfig {
     #[serde(flatten)]
     pub common: MessageChannelConfig,
+    #[serde(default = "default_telegram_api_base_url")]
+    pub api_base_url: String,
     #[serde(default)]
     pub bot_token: String,
     #[serde(default)]
@@ -199,7 +233,7 @@ pub struct TelegramConfig {
     pub disable_web_page_preview: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ServerChan3Config {
     #[serde(flatten)]
     pub common: MessageChannelConfig,
@@ -239,7 +273,7 @@ pub struct EmailConfig {
     pub message_format: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LegacyNotificationConfig {
     #[serde(default)]
     pub webhook: WebhookConfig,
@@ -451,6 +485,10 @@ pub struct NotificationRule {
     pub title_template: String,
     #[serde(default)]
     pub template: String,
+    /// 自定义请求体 JSON 模板。非空时覆盖默认的纯文本发送逻辑，
+    /// 直接将渲染后的 JSON 作为通道的 HTTP 请求体发送。
+    #[serde(default)]
+    pub custom_body: String,
     #[serde(default)]
     pub quiet_hours: Vec<QuietHoursSchedule>,
     #[serde(default = "default_ddns_failure_threshold")]
@@ -592,7 +630,7 @@ impl<'de> Deserialize<'de> for NotificationConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub struct DeviceNetworkConfig {
     #[serde(default)]
@@ -608,25 +646,6 @@ pub struct VersionUpdateNotificationConfig {
     pub proxy_prefix: String,
     #[serde(default)]
     pub last_notified_version: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub struct SecurityConfig {
-    #[serde(default = "default_true")]
-    pub password_protection_enabled: bool,
-    #[serde(default = "default_password_min_length")]
-    pub password_min_length: u8,
-    #[serde(default = "default_true")]
-    pub password_require_letters: bool,
-    #[serde(default = "default_true")]
-    pub password_require_digits: bool,
-    #[serde(default = "default_true")]
-    pub password_require_symbols: bool,
-    #[serde(default = "default_session_ttl_seconds")]
-    pub session_ttl_seconds: i64,
-    #[serde(default = "default_idle_timeout_seconds")]
-    pub idle_timeout_seconds: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -743,6 +762,14 @@ fn default_wecom_to_user() -> String {
     "@all".to_string()
 }
 
+fn default_wecom_api_base_url() -> String {
+    "https://qyapi.weixin.qq.com".to_string()
+}
+
+fn default_telegram_api_base_url() -> String {
+    String::new()
+}
+
 fn default_dingtalk_msg_key() -> String {
     "sampleText".to_string()
 }
@@ -759,11 +786,16 @@ fn default_email_message_format() -> String {
     "plain".to_string()
 }
 
+fn default_webhook_http_method() -> String {
+    "POST".to_string()
+}
+
 impl Default for WebhookConfig {
     fn default() -> Self {
         Self {
             enabled: false,
             url: String::new(),
+            http_method: default_webhook_http_method(),
             forward_sms: true,
             forward_calls: true,
             forward_ddns: true,
@@ -832,6 +864,7 @@ impl Default for WecomAppConfig {
     fn default() -> Self {
         Self {
             common: MessageChannelConfig::default(),
+            api_base_url: default_wecom_api_base_url(),
             corp_id: String::new(),
             agent_id: String::new(),
             secret: String::new(),
@@ -839,29 +872,6 @@ impl Default for WecomAppConfig {
             to_party: String::new(),
             to_tag: String::new(),
             safe: false,
-        }
-    }
-}
-
-impl Default for WecomRobotConfig {
-    fn default() -> Self {
-        Self {
-            common: MessageChannelConfig::default(),
-            webhook_url: String::new(),
-            key: String::new(),
-        }
-    }
-}
-
-impl Default for DingtalkRobotConfig {
-    fn default() -> Self {
-        Self {
-            common: MessageChannelConfig::default(),
-            webhook_url: String::new(),
-            access_token: String::new(),
-            secret: String::new(),
-            at_mobiles: String::new(),
-            at_all: false,
         }
     }
 }
@@ -879,37 +889,15 @@ impl Default for DingtalkAppConfig {
     }
 }
 
-impl Default for FeishuRobotConfig {
-    fn default() -> Self {
-        Self {
-            common: MessageChannelConfig::default(),
-            webhook_url: String::new(),
-            token: String::new(),
-            secret: String::new(),
-        }
-    }
-}
-
 impl Default for TelegramConfig {
     fn default() -> Self {
         Self {
             common: MessageChannelConfig::default(),
+            api_base_url: default_telegram_api_base_url(),
             bot_token: String::new(),
             chat_id: String::new(),
             parse_mode: String::new(),
             disable_web_page_preview: true,
-        }
-    }
-}
-
-impl Default for ServerChan3Config {
-    fn default() -> Self {
-        Self {
-            common: MessageChannelConfig::default(),
-            send_key: String::new(),
-            uid: String::new(),
-            channel: String::new(),
-            openid: String::new(),
         }
     }
 }
@@ -928,24 +916,6 @@ impl Default for EmailConfig {
             sender_name: String::new(),
             receiver_addresses: String::new(),
             message_format: default_email_message_format(),
-        }
-    }
-}
-
-impl Default for LegacyNotificationConfig {
-    fn default() -> Self {
-        Self {
-            webhook: WebhookConfig::default(),
-            bark: BarkConfig::default(),
-            pushplus: PushPlusConfig::default(),
-            wecom_app: WecomAppConfig::default(),
-            wecom_robot: WecomRobotConfig::default(),
-            dingtalk_robot: DingtalkRobotConfig::default(),
-            dingtalk_app: DingtalkAppConfig::default(),
-            feishu_robot: FeishuRobotConfig::default(),
-            telegram: TelegramConfig::default(),
-            serverchan3: ServerChan3Config::default(),
-            email: EmailConfig::default(),
         }
     }
 }
@@ -1256,6 +1226,7 @@ fn push_legacy_rule(
         event_codes: Vec::new(),
         title_template: default_rule_title_template(event_type),
         template,
+        custom_body: String::new(),
         quiet_hours: Vec::new(),
         ddns_failure_threshold: default_ddns_failure_threshold(),
         device_status_items: default_device_status_items(),
@@ -1325,34 +1296,12 @@ pub fn default_rule_title_template(event_type: NotificationEventType) -> String 
     }
 }
 
-impl Default for DeviceNetworkConfig {
-    fn default() -> Self {
-        Self {
-            ddns: DdnsConfig::default(),
-        }
-    }
-}
-
 impl Default for VersionUpdateNotificationConfig {
     fn default() -> Self {
         Self {
             enabled: true,
             proxy_prefix: String::new(),
             last_notified_version: None,
-        }
-    }
-}
-
-impl Default for SecurityConfig {
-    fn default() -> Self {
-        Self {
-            password_protection_enabled: true,
-            password_min_length: default_password_min_length(),
-            password_require_letters: true,
-            password_require_digits: true,
-            password_require_symbols: true,
-            session_ttl_seconds: default_session_ttl_seconds(),
-            idle_timeout_seconds: default_idle_timeout_seconds(),
         }
     }
 }
@@ -1420,21 +1369,177 @@ pub struct AutomationTask {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "config", rename_all = "snake_case")]
 pub enum AutomationTrigger {
-    Fixed { weekdays: Vec<u8>, times: Vec<String> },
-    Interval { interval_value: u64, interval_unit: String },
+    Fixed {
+        weekdays: Vec<u8>,
+        times: Vec<String>,
+    },
+    Interval {
+        interval_value: u64,
+        interval_unit: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "config", rename_all = "snake_case")]
 pub enum AutomationAction {
     RestartBaseband,
-    RebootDevice { delay_seconds: u32 },
+    RebootDevice {
+        delay_seconds: u32,
+    },
+    BackupData {
+        components: Vec<String>,
+        storage: BackupStorageConfig,
+    },
     SendSms {
         phone_number: String,
         content: String,
         random_delay_seconds: Option<u32>,
         retry_limit: Option<u32>,
     },
+}
+
+fn default_backup_components() -> Vec<String> {
+    [
+        "config",
+        "sms",
+        "notification_config",
+        "automation_config",
+        "sim_cache",
+        "esim_cache",
+    ]
+    .into_iter()
+    .map(ToString::to_string)
+    .collect()
+}
+
+fn default_backup_local_dir() -> String {
+    "/opt/simadmin/backups".to_string()
+}
+
+fn default_backup_retention_days() -> u32 {
+    7
+}
+
+fn default_backup_max_files() -> u32 {
+    10
+}
+
+fn default_backup_interval_value() -> u64 {
+    7
+}
+
+fn default_backup_interval_unit() -> String {
+    "days".to_string()
+}
+
+fn default_backup_times() -> Vec<String> {
+    vec!["04:00".to_string()]
+}
+
+fn default_backup_weekdays() -> Vec<u8> {
+    vec![1, 2, 3, 4, 5, 6, 7]
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_backup_components")]
+    pub components: Vec<String>,
+    #[serde(default)]
+    pub schedule: BackupScheduleConfig,
+    #[serde(default)]
+    pub cleanup: BackupCleanupConfig,
+    #[serde(default)]
+    pub storage: BackupStorageConfig,
+    #[serde(default)]
+    pub last_run_at: String,
+    #[serde(default)]
+    pub last_run_key: String,
+}
+
+impl Default for BackupConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            components: default_backup_components(),
+            schedule: BackupScheduleConfig::default(),
+            cleanup: BackupCleanupConfig::default(),
+            storage: BackupStorageConfig::default(),
+            last_run_at: String::new(),
+            last_run_key: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct BackupScheduleConfig {
+    #[serde(default = "default_backup_schedule_mode")]
+    pub mode: String,
+    #[serde(default = "default_backup_weekdays")]
+    pub weekdays: Vec<u8>,
+    #[serde(default = "default_backup_times")]
+    pub times: Vec<String>,
+    #[serde(default = "default_backup_interval_value")]
+    pub interval_value: u64,
+    #[serde(default = "default_backup_interval_unit")]
+    pub interval_unit: String,
+}
+
+fn default_backup_schedule_mode() -> String {
+    "manual".to_string()
+}
+
+impl Default for BackupScheduleConfig {
+    fn default() -> Self {
+        Self {
+            mode: default_backup_schedule_mode(),
+            weekdays: default_backup_weekdays(),
+            times: default_backup_times(),
+            interval_value: default_backup_interval_value(),
+            interval_unit: default_backup_interval_unit(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct BackupCleanupConfig {
+    #[serde(default = "default_true")]
+    pub retention_days_enabled: bool,
+    #[serde(default = "default_backup_retention_days")]
+    pub retention_days: u32,
+    #[serde(default = "default_true")]
+    pub max_files_enabled: bool,
+    #[serde(default = "default_backup_max_files")]
+    pub max_files: u32,
+}
+
+impl Default for BackupCleanupConfig {
+    fn default() -> Self {
+        Self {
+            retention_days_enabled: true,
+            retention_days: default_backup_retention_days(),
+            max_files_enabled: true,
+            max_files: default_backup_max_files(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct BackupStorageConfig {
+    #[serde(default = "default_backup_local_dir")]
+    pub local_dir: String,
+}
+
+impl Default for BackupStorageConfig {
+    fn default() -> Self {
+        Self {
+            local_dir: default_backup_local_dir(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1535,6 +1640,7 @@ mod tests {
             event_codes: Vec::new(),
             title_template: String::new(),
             template: "版本号: {{版本号}}\nCommit: {{Commit}}\n构建时间: {{构建时间}}\nMD5: {{MD5}}\n来源: {{本机号码}}".to_string(),
+            custom_body: String::new(),
             quiet_hours: Vec::new(),
             ddns_failure_threshold: 1,
             device_status_items: default_device_status_items(),
@@ -1606,18 +1712,6 @@ fn default_data_enabled() -> bool {
     false
 }
 
-fn default_password_min_length() -> u8 {
-    8
-}
-
-fn default_session_ttl_seconds() -> i64 {
-    7 * 24 * 60 * 60
-}
-
-fn default_idle_timeout_seconds() -> i64 {
-    60 * 60
-}
-
 fn default_apn_protocol() -> String {
     "dual".to_string()
 }
@@ -1677,6 +1771,8 @@ impl Default for EsimConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     #[serde(default)]
+    pub hub: HubConfig,
+    #[serde(default)]
     pub webhook: WebhookConfig,
     #[serde(default)]
     pub notifications: NotificationConfig,
@@ -1699,11 +1795,14 @@ pub struct AppConfig {
     pub esim: EsimConfig,
     #[serde(default)]
     pub automation: AutomationConfig,
+    #[serde(default)]
+    pub backup: BackupConfig,
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
+            hub: HubConfig::default(),
             webhook: WebhookConfig::default(),
             notifications: NotificationConfig::default(),
             device_network: DeviceNetworkConfig::default(),
@@ -1715,6 +1814,7 @@ impl Default for AppConfig {
             work_mode: WorkMode::default(),
             esim: EsimConfig::default(),
             automation: AutomationConfig::default(),
+            backup: BackupConfig::default(),
         }
     }
 }
@@ -1724,14 +1824,16 @@ fn migrate_legacy_webhook_config(config: &mut AppConfig) {
         && config.notifications.rules.is_empty()
         && config.webhook != WebhookConfig::default()
     {
-        let mut legacy = LegacyNotificationConfig::default();
-        legacy.webhook = config.webhook.clone();
+        let legacy = LegacyNotificationConfig {
+            webhook: config.webhook.clone(),
+            ..Default::default()
+        };
         config.notifications = NotificationConfig::from_legacy(legacy);
     }
     config.webhook = config
         .notifications
         .first_webhook_config()
-        .unwrap_or_else(WebhookConfig::default);
+        .unwrap_or_default();
 }
 
 fn migrate_update_template_string(template: &mut String) -> bool {
@@ -1823,10 +1925,10 @@ fn migrate_update_templates(config: &mut AppConfig) -> bool {
 
     // 2. Notification rules templates
     for rule in &mut config.notifications.rules {
-        if rule.event_type == NotificationEventType::VersionUpdate {
-            if migrate_update_template_string(&mut rule.template) {
-                changed = true;
-            }
+        if rule.event_type == NotificationEventType::VersionUpdate
+            && migrate_update_template_string(&mut rule.template)
+        {
+            changed = true;
         }
     }
 
@@ -1901,6 +2003,42 @@ impl ConfigManager {
         self.config.read().unwrap().notifications.clone()
     }
 
+    pub fn get_config(&self) -> AppConfig {
+        self.config.read().unwrap().clone()
+    }
+
+    pub fn get_hub_config(&self) -> HubConfig {
+        self.config.read().unwrap().hub.clone()
+    }
+
+    pub fn set_hub_config(&self, hub: HubConfig) -> Result<(), String> {
+        if hub.enabled && !hub.url.trim().is_empty() {
+            let url = hub.url.trim();
+            let parsed =
+                reqwest::Url::parse(url).map_err(|error| format!("Hub URL 无效: {error}"))?;
+            if !matches!(parsed.scheme(), "http" | "https")
+                || parsed.host().is_none()
+                || !parsed.username().is_empty()
+                || parsed.password().is_some()
+                || parsed.query().is_some()
+                || parsed.fragment().is_some()
+                || !matches!(parsed.path(), "" | "/")
+            {
+                return Err("Hub 地址只能包含 http(s)、主机名和可选端口".into());
+            }
+        }
+        self.config.write().unwrap().hub = hub;
+        self.save()
+    }
+
+    pub fn replace_config(&self, config: AppConfig) -> Result<(), String> {
+        {
+            let mut current = self.config.write().unwrap();
+            *current = config;
+        }
+        self.save()
+    }
+
     /// 获取自动化配置
     pub fn get_automation_config(&self) -> AutomationConfig {
         self.config.read().unwrap().automation.clone()
@@ -1911,6 +2049,18 @@ impl ConfigManager {
         {
             let mut config = self.config.write().unwrap();
             config.automation = automation;
+        }
+        self.save()
+    }
+
+    pub fn get_backup_config(&self) -> BackupConfig {
+        self.config.read().unwrap().backup.clone()
+    }
+
+    pub fn set_backup_config(&self, backup: BackupConfig) -> Result<(), String> {
+        {
+            let mut config = self.config.write().unwrap();
+            config.backup = backup;
         }
         self.save()
     }
@@ -2023,9 +2173,7 @@ impl ConfigManager {
     pub fn set_notifications(&self, notifications: NotificationConfig) -> Result<(), String> {
         {
             let mut config = self.config.write().unwrap();
-            config.webhook = notifications
-                .first_webhook_config()
-                .unwrap_or_else(WebhookConfig::default);
+            config.webhook = notifications.first_webhook_config().unwrap_or_default();
             config.notifications = notifications;
         }
         self.save()
@@ -2052,6 +2200,9 @@ impl ConfigManager {
 
 /// 获取默认配置文件路径
 pub fn get_default_config_path() -> PathBuf {
+    if let Some(path) = std::env::var_os("SIMADMIN_DATA_DIR") {
+        return PathBuf::from(path).join("config.json");
+    }
     // 尝试 /data/config.json（设备上的持久化目录）
     let device_path = PathBuf::from("/data/config.json");
     if device_path.parent().map(|p| p.exists()).unwrap_or(false) {
